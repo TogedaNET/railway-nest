@@ -17,9 +17,10 @@ import { ScheduleModule } from '@nestjs/schedule';
           socket: {
             host: process.env.REDISHOST,
             port: +process.env.REDISPORT,
+            tls: true,
           },
           url: process.env.REDISURL,
-          password: process.env.REDISPASSWORD
+          password: process.env.REDISPASSWORD,
         });
         return {
           store: store as unknown as CacheStore,
@@ -35,7 +36,8 @@ import { ScheduleModule } from '@nestjs/schedule';
         username: process.env.POSTGRESUSER,
         password: process.env.POSTGRESPASSWORD,
         database: process.env.POSTGRESDB,
-        synchronize: true,
+        synchronize: false,
+        ssl: true,
         entities: []
       })
     }),
