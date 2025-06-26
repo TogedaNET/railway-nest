@@ -53,7 +53,7 @@ export class FeedJobsService {
     this.pgClient.connect();
   }
 
-  @Cron(CronExpression.EVERY_10_SECONDS, { disabled: true })
+  @Cron(CronExpression.EVERY_DAY_AT_2AM)
   async updateTrendingPosts() {
     if (this.isRunning) {
       this.logger.warn(
@@ -198,7 +198,7 @@ export class FeedJobsService {
     );
   }
 
-  @Cron(CronExpression.EVERY_10_SECONDS)
+  @Cron(CronExpression.EVERY_6_HOURS)
   async prePopulateAllActiveUsersFeeds() {
     if (this.isRunning2) {
       this.logger.warn(
