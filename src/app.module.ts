@@ -5,6 +5,7 @@ import { redisStore } from 'cache-manager-redis-store';
 import { ScheduleModule } from '@nestjs/schedule';
 import { FeedJobsService } from './jobs/feed.jobs';
 import { HttpModule, HttpService } from '@nestjs/axios';
+import { ShutdownService } from './utils/shutdown.service';
 
 @Module({
   imports: [
@@ -30,6 +31,6 @@ import { HttpModule, HttpService } from '@nestjs/axios';
     ScheduleModule.forRoot(),
     HttpModule,
   ],
-  providers: [FeedJobsService],
+  providers: [FeedJobsService, ShutdownService],
 })
 export class AppModule {}

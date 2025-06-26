@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnApplicationShutdown } from '@nestjs/common';
 
 @Injectable()
-class ShutdownService implements OnApplicationShutdown {
+export class ShutdownService implements OnApplicationShutdown {
   private readonly logger = new Logger(ShutdownService.name, {
     timestamp: true,
   });
