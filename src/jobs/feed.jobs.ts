@@ -3,7 +3,7 @@ import { Injectable, Logger, Inject } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
-import { Client } from 'pg';
+import { Pool } from 'pg';
 import * as ngeohash from 'ngeohash';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
@@ -33,7 +33,7 @@ export class FeedJobsService {
   private readonly logger = new Logger(FeedJobsService.name, {
     timestamp: true,
   });
-  private readonly pgClient: Client;
+  private readonly pgPool: Pool;
   private isRunning = false;
   private isRunning2 = false;
 
@@ -42,7 +42,7 @@ export class FeedJobsService {
     private readonly cacheManager: Cache,
     private readonly httpService: HttpService,
   ) {
-    this.pgClient = new Client({
+    this.pgPool = new Pool({
       host: process.env.POSTGRESHOST,
       port: +process.env.POSTGRESPORT,
       user: process.env.POSTGRESUSER,
@@ -50,7 +50,6 @@ export class FeedJobsService {
       database: process.env.POSTGRESDB,
       ssl: true,
     });
-    this.pgClient.connect();
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_2AM)
@@ -66,7 +65,7 @@ export class FeedJobsService {
       this.logger.log('updateTrendingPosts called');
 
       // 1. Fetch all posts with location, creation date, user_id, user_role, and participant count
-      const { rows: posts } = await this.pgClient.query(
+      const { rows: posts } = await this.pgPool.query(
         `SELECT p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, 
                 COUNT(pp.id) AS participant_count
          FROM post p
@@ -247,7 +246,7 @@ export class FeedJobsService {
 
   async cachePersonalizedFeedForAllUsers(userIds: string[]) {
     // 1. Fetch all user info, interests, friends, clubs
-    const { rows: users } = await this.pgClient.query(
+    const { rows: users } = await this.pgPool.query(
       `
       SELECT id, latitude, longitude FROM user_info WHERE id = ANY($1)
     `,
@@ -256,7 +255,7 @@ export class FeedJobsService {
     const userMap = Object.fromEntries(users.map((u) => [u.id, u]));
 
     // Interests
-    const { rows: userInterests } = await this.pgClient.query(
+    const { rows: userInterests } = await this.pgPool.query(
       `
       SELECT user_id, interest_id FROM user_interests WHERE user_id = ANY($1)
     `,
@@ -269,7 +268,7 @@ export class FeedJobsService {
     }
 
     // Friends
-    const { rows: userFriends } = await this.pgClient.query(
+    const { rows: userFriends } = await this.pgPool.query(
       `
       SELECT user_id, friend_id FROM user_friends WHERE user_id = ANY($1)
     `,
@@ -282,7 +281,7 @@ export class FeedJobsService {
     }
 
     // Clubs
-    const { rows: userClubs } = await this.pgClient.query(
+    const { rows: userClubs } = await this.pgPool.query(
       `
       SELECT user_id, club_id FROM club_member WHERE user_id = ANY($1)
     `,
@@ -295,7 +294,7 @@ export class FeedJobsService {
     }
 
     // 2. Fetch all candidate posts and their data (trending posts in region, or all posts)
-    const { rows: posts } = await this.pgClient.query(`
+    const { rows: posts } = await this.pgPool.query(`
       SELECT p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, p.club_id,
              COUNT(pp.id) AS participant_count
       FROM post p
@@ -306,7 +305,7 @@ export class FeedJobsService {
     `);
 
     // Post interests
-    const { rows: postInterests } = await this.pgClient.query(`
+    const { rows: postInterests } = await this.pgPool.query(`
       SELECT post_id, interest_id FROM post_interests
     `);
     const postInterestMap = {};
@@ -316,7 +315,7 @@ export class FeedJobsService {
     }
 
     // Post participants
-    const { rows: postParticipants } = await this.pgClient.query(`
+    const { rows: postParticipants } = await this.pgPool.query(`
       SELECT post_id, user_id FROM post_participant
     `);
     const postParticipantMap = {};
