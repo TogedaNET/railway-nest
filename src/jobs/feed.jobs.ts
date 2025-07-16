@@ -64,14 +64,14 @@ export class FeedJobsService {
     try {
       this.logger.log('updateTrendingPosts called');
 
-      // 1. Fetch all posts with location, creation date, user_id, user_role, and participant count
+      // 1. Fetch all posts with status 'NOT_STARTED', creation date, user_id, user_role, and participant count
       const { rows: posts } = await this.pgPool.query(
         `SELECT p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, 
                 COUNT(pp.id) AS participant_count
          FROM post p
          JOIN user_info ui ON p.user_id = ui.id
          LEFT JOIN post_participant pp ON p.id = pp.post_id
-         WHERE p.latitude IS NOT NULL AND p.longitude IS NOT NULL
+         WHERE p.status = 'NOT_STARTED'
          GROUP BY p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role`,
       );
 
@@ -125,13 +125,8 @@ export class FeedJobsService {
         await this.cacheManager.set(
           redisKey,
           top.map((p) => p.id),
-          60 * 60 * 1000,
-        ); // 1 hour TTL
-        await this.cacheManager.set(
-          lastUpdatedKey,
-          new Date().toISOString(),
-          0,
         ); // no expiration
+        await this.cacheManager.set(lastUpdatedKey, new Date().toISOString()); // no expiration
       }
 
       this.logger.log('Trending posts updated in Redis by geohash clusters');
@@ -293,14 +288,14 @@ export class FeedJobsService {
       userClubMap[user_id].add(club_id);
     }
 
-    // 2. Fetch all candidate posts and their data (trending posts in region, or all posts)
+    // 2. Fetch all posts and their data
     const { rows: posts } = await this.pgPool.query(`
       SELECT p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, p.club_id,
              COUNT(pp.id) AS participant_count
       FROM post p
       JOIN user_info ui ON p.user_id = ui.id
       LEFT JOIN post_participant pp ON p.id = pp.post_id
-      WHERE p.latitude IS NOT NULL AND p.longitude IS NOT NULL
+      WHERE p.status = 'NOT_STARTED'
       GROUP BY p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, p.club_id
     `);
 
@@ -324,7 +319,9 @@ export class FeedJobsService {
       postParticipantMap[post_id].add(user_id);
     }
 
-    // 3. For each user, score all posts
+    const redisOps: Array<{ key: string; value: any }> = [];
+
+    // 3. For each user, score only posts within 500km (concurrently)
     for (const userId of userIds) {
       const user = userMap[userId];
       if (!user) continue;
@@ -334,7 +331,18 @@ export class FeedJobsService {
       const userFriendsSet = userFriendMap[userId] || new Set();
       const userClubsSet = userClubMap[userId] || new Set();
 
-      const scoredPosts = posts.map((post) => {
+      // Filter posts within 500km
+      const nearbyPosts = posts.filter((post) => {
+        const distance = this.haversine(
+          userLat,
+          userLon,
+          post.latitude,
+          post.longitude,
+        );
+        return distance < 500;
+      });
+
+      const scoredPosts = nearbyPosts.map((post) => {
         // Location score (closer = higher, e.g., 1 / (distance_km + 1))
         const distance = this.haversine(
           userLat,
@@ -393,11 +401,22 @@ export class FeedJobsService {
 
       // Store in Redis
       const redisKey = `personalized:feed:${userId}`;
-      await this.cacheManager.set(
-        redisKey,
-        top.map((p) => p.postId),
-        60 * 60 * 1000,
-      ); // 1 hour TTL
+      redisOps.push({
+        key: redisKey,
+        value: top.map((p) => p.postId),
+      });
+      // await this.cacheManager.set(
+      //   redisKey,
+      //   top.map((p) => p.postId),
+      //   { ttl: 60 * 60 } as any, // https://github.com/dabroek/node-cache-manager-redis-store/issues/40#issuecomment-1318816820
+      // ); // 1 hour TTL
     }
+    // @ts-ignore
+    const redisClient = this.cacheManager.store.getClient();
+    const pipeline = redisClient.multi();
+    for (const op of redisOps) {
+      pipeline.set(op.key, JSON.stringify(op.value), { EX: 60 * 24 * 5 }); // 1 hour TTL in ms
+    }
+    await pipeline.exec();
   }
 }
