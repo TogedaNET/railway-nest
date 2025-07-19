@@ -56,6 +56,9 @@ $ npm run test:e2e
 
 # test coverage
 $ npm run test:cov
+
+# run specific test
+$ npm run test:e2e -- -t "updateTrendingPosts"
 ```
 
 ## Resources

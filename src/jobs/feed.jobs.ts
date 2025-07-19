@@ -1,12 +1,13 @@
 // src/jobs/feed.jobs.ts
 import { Injectable, Logger, Inject } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { CACHE_MANAGER } from '@nestjs/cache-manager';
-import { Cache } from 'cache-manager';
 import { Pool } from 'pg';
 import * as ngeohash from 'ngeohash';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
+import { v4 as uuidv4 } from 'uuid';
+import { createClient } from 'redis';
+import * as dayjs from 'dayjs';
 
 // Type for Mixpanel Engage API response
 interface MixpanelEngageUser {
@@ -34,14 +35,11 @@ export class FeedJobsService {
     timestamp: true,
   });
   private readonly pgPool: Pool;
+  private readonly redisClient;
   private isRunning = false;
   private isRunning2 = false;
 
-  constructor(
-    @Inject(CACHE_MANAGER)
-    private readonly cacheManager: Cache,
-    private readonly httpService: HttpService,
-  ) {
+  constructor(private readonly httpService: HttpService) {
     this.pgPool = new Pool({
       host: process.env.POSTGRESHOST,
       port: +process.env.POSTGRESPORT,
@@ -50,6 +48,24 @@ export class FeedJobsService {
       database: process.env.POSTGRESDB,
       ssl: true,
     });
+
+    this.redisClient = createClient({
+      url: process.env.REDISURL,
+      socket: {
+        tls: true,
+      },
+    });
+    this.redisClient.on('error', (err) =>
+      this.logger.error('Redis Client Error', err),
+    );
+    this.redisClient.on('end', () =>
+      this.logger.warn('Redis connection closed'),
+    );
+    this.redisClient.on('reconnecting', () =>
+      this.logger.warn('Redis client reconnecting...'),
+    );
+
+    this.redisClient.connect();
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_2AM)
@@ -98,10 +114,12 @@ export class FeedJobsService {
       }
 
       // 3. For each cluster, score posts by timing, partner boost, and popularity, and store top 500 in Redis
-      for (const [hash, clusterPosts] of Object.entries(clusters)) {
+      // Also add all trending posts to a global geospatial index with TTL
+      const geoKey = 'trending:geoindex';
+      const geoTTLSeconds = 60 * 60 * 24; // 24 hour
+      for (const [, clusterPosts] of Object.entries(clusters)) {
         const scored = clusterPosts.map((post) => {
           // Timing score: 1 / (hours since created + 1)
-          const dayjs = require('dayjs');
           const hoursSinceCreated = Math.abs(
             dayjs().diff(dayjs(post.created_at), 'hour'),
           );
@@ -118,16 +136,30 @@ export class FeedJobsService {
         // Sort by score descending and take top 500
         const top = scored.sort((a, b) => b.score - a.score).slice(0, 500);
 
-        // Store in Redis (as a list of post IDs)
-        const redisKey = `trending:geo:${hash}`;
-        const lastUpdatedKey = `${redisKey}:lastUpdatedAt`;
-
-        await this.cacheManager.set(
-          redisKey,
-          top.map((p) => p.id),
-        ); // no expiration
-        await this.cacheManager.set(lastUpdatedKey, new Date().toISOString()); // no expiration
+        // Add all posts in this cluster to the global geospatial index (avoid duplicates)
+        for (const post of top) {
+          const lat = post.latitude;
+          const lon = post.longitude;
+          if (
+            lon < -180 ||
+            lon > 180 ||
+            lat < -85.05112878 ||
+            lat > 85.05112878
+          ) {
+            this.logger.warn(
+              `Skipping geoAdd for post ${post.id}: out-of-range coordinates (${lat}, ${lon})`,
+            );
+            continue;
+          }
+          await this.redisClient.geoAdd(geoKey, {
+            longitude: lon,
+            latitude: lat,
+            member: post.id.toString(),
+          });
+        }
       }
+      // Set TTL for the geospatial index key
+      await this.redisClient.expire(geoKey, geoTTLSeconds);
 
       this.logger.log('Trending posts updated in Redis by geohash clusters');
     } catch (error) {
@@ -353,7 +385,6 @@ export class FeedJobsService {
         const locationScore = 1 / (distance + 1);
 
         // Timing score
-        const dayjs = require('dayjs');
         const hoursSinceCreated = Math.abs(
           dayjs().diff(dayjs(post.created_at), 'hour'),
         );
@@ -401,21 +432,21 @@ export class FeedJobsService {
 
       // Store in Redis
       const redisKey = `personalized:feed:${userId}`;
+      const now = Date.now();
+      const feedObj = {
+        post_ids: top.map((p) => p.postId),
+        version: uuidv4(), // or increment a version counter
+        created_at: now,
+        total_posts: top.length,
+      };
       redisOps.push({
         key: redisKey,
-        value: top.map((p) => p.postId),
+        value: feedObj,
       });
-      // await this.cacheManager.set(
-      //   redisKey,
-      //   top.map((p) => p.postId),
-      //   { ttl: 60 * 60 } as any, // https://github.com/dabroek/node-cache-manager-redis-store/issues/40#issuecomment-1318816820
-      // ); // 1 hour TTL
     }
-    // @ts-ignore
-    const redisClient = this.cacheManager.store.getClient();
-    const pipeline = redisClient.multi();
+    const pipeline = this.redisClient.multi();
     for (const op of redisOps) {
-      pipeline.set(op.key, JSON.stringify(op.value), { EX: 60 * 24 * 5 }); // 1 hour TTL in ms
+      pipeline.set(op.key, JSON.stringify(op.value), { EX: 60 * 60 * 24 * 3 }); // 3 days ttl
     }
     await pipeline.exec();
   }
