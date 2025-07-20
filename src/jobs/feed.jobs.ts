@@ -37,10 +37,12 @@ export class FeedJobsService {
   private readonly pgPool: Pool;
   private isRunning = false;
   private isRunning2 = false;
+  private redisSubscriber: RedisClientType<any, any>;
 
   constructor(
     private readonly httpService: HttpService,
-    @Inject('REDIS_CLIENT') private readonly redisClient: RedisClientType,
+    @Inject('REDIS_CLIENT')
+    private readonly redisClient: RedisClientType<any, any>,
   ) {
     this.pgPool = new Pool({
       host: process.env.POSTGRESHOST,
@@ -50,6 +52,38 @@ export class FeedJobsService {
       database: process.env.POSTGRESDB,
       ssl: true,
     });
+    this.initRedisSubscriber();
+  }
+
+  private async initRedisSubscriber() {
+    // node-redis v4+ requires a separate client for pub/sub
+    this.redisSubscriber = this.redisClient.duplicate();
+    this.redisSubscriber.on('error', (err) =>
+      this.logger.error('Redis Subscriber Error for pub/sub', err),
+    );
+    await this.redisSubscriber.connect();
+    await this.redisSubscriber.subscribe('post.created', async (message) => {
+      await this.handlePostCreatedEvent(message);
+    });
+    this.logger.log('Subscribed to Redis channel: post.created');
+  }
+
+  private async handlePostCreatedEvent(message: string) {
+    this.logger.log(`Received post.created event: ${message}`);
+    let postEvent;
+    try {
+      postEvent =
+        typeof message === 'string' ? JSON.parse(JSON.parse(message)) : message;
+    } catch (e) {
+      this.logger.error('Failed to parse post.created event message', e);
+      return;
+    }
+    this.logger.log('Parsed postEvent:', postEvent);
+    if (!postEvent || !postEvent.postId) {
+      this.logger.error('post.created event missing postId');
+      return;
+    }
+    await this.prePopulateUserFeedsInRange(postEvent.postId);
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_2AM)
@@ -235,6 +269,50 @@ export class FeedJobsService {
       this.logger.error('Error in prePopulateAllActiveUsersFeeds', error);
     } finally {
       this.isRunning2 = false;
+    }
+  }
+
+  async prePopulateUserFeedsInRange(postId: string) {
+    this.logger.log('prePopulateUserFeedsInRange called');
+    try {
+      // Fetch post location
+      const { rows: postRows } = await this.pgPool.query(
+        'SELECT latitude, longitude FROM post WHERE id = $1',
+        [postId],
+      );
+      if (!postRows.length) {
+        this.logger.warn(`Post not found for id: ${postId}`);
+        return;
+      }
+      const postLat = postRows[0].latitude;
+      const postLon = postRows[0].longitude;
+      if (postLat == null || postLon == null) {
+        this.logger.error(`Post ${postId} missing coordinates`);
+        return;
+      }
+      const userIds = await this.fetchAllMixpanelCohortUsers();
+      this.logger.log(`Users active: ${userIds.length}`);
+
+      // Fetch user locations
+      const { rows: users } = await this.pgPool.query(
+        'SELECT id, latitude, longitude FROM user_info WHERE id = ANY($1)',
+        [userIds],
+      );
+      // Filter users within 500km
+      const filteredUserIds = users
+        .filter(
+          (u) =>
+            u.latitude != null &&
+            u.longitude != null &&
+            this.haversine(postLat, postLon, u.latitude, u.longitude) < 500,
+        )
+        .map((u) => u.id);
+      this.logger.log(`Users within 500km: ${filteredUserIds.length}`);
+
+      await this.cachePersonalizedFeedForAllUsers(filteredUserIds);
+      this.logger.log(`prePopulateUserFeedsInRange finished`);
+    } catch (error) {
+      this.logger.error('Error in prePopulateUserFeedsInRange', error);
     }
   }
 
