@@ -1,31 +1,14 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
-import { CacheModule, CacheStore } from '@nestjs/cache-manager';
-import { redisStore } from 'cache-manager-redis-store';
 import { ScheduleModule } from '@nestjs/schedule';
 import { FeedJobsService } from './jobs/feed.jobs';
 import { HttpModule } from '@nestjs/axios';
+import { RedisModule } from './redis/redis.module';
 
 @Module({
   imports: [
     ConfigModule.forRoot(),
-    CacheModule.registerAsync({
-      isGlobal: true,
-      useFactory: async () => {
-        const store = await redisStore({
-          socket: {
-            host: process.env.REDISHOST,
-            port: +process.env.REDISPORT,
-            tls: true,
-          },
-          url: process.env.REDISURL,
-          password: process.env.REDISPASSWORD,
-        });
-        return {
-          store: store as unknown as CacheStore,
-        };
-      },
-    }),
+    RedisModule,
     ScheduleModule.forRoot(),
     HttpModule,
   ],

@@ -58,7 +58,7 @@ $ npm run test:e2e
 $ npm run test:cov
 
 # run specific test
-$ npm run test:e2e -- -t "updateTrendingPosts"
+$ npm run test:e2e -- -t "updateTrendingPosts" --forceExit
 ```
 
 ## Resources

@@ -6,8 +6,8 @@ import * as ngeohash from 'ngeohash';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
 import { v4 as uuidv4 } from 'uuid';
-import { createClient } from 'redis';
 import * as dayjs from 'dayjs';
+import { RedisClientType } from 'redis';
 
 // Type for Mixpanel Engage API response
 interface MixpanelEngageUser {
@@ -35,11 +35,13 @@ export class FeedJobsService {
     timestamp: true,
   });
   private readonly pgPool: Pool;
-  private readonly redisClient;
   private isRunning = false;
   private isRunning2 = false;
 
-  constructor(private readonly httpService: HttpService) {
+  constructor(
+    private readonly httpService: HttpService,
+    @Inject('REDIS_CLIENT') private readonly redisClient: RedisClientType,
+  ) {
     this.pgPool = new Pool({
       host: process.env.POSTGRESHOST,
       port: +process.env.POSTGRESPORT,
@@ -48,24 +50,6 @@ export class FeedJobsService {
       database: process.env.POSTGRESDB,
       ssl: true,
     });
-
-    this.redisClient = createClient({
-      url: process.env.REDISURL,
-      socket: {
-        tls: true,
-      },
-    });
-    this.redisClient.on('error', (err) =>
-      this.logger.error('Redis Client Error', err),
-    );
-    this.redisClient.on('end', () =>
-      this.logger.warn('Redis connection closed'),
-    );
-    this.redisClient.on('reconnecting', () =>
-      this.logger.warn('Redis client reconnecting...'),
-    );
-
-    this.redisClient.connect();
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_2AM)
