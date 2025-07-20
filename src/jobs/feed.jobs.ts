@@ -120,7 +120,7 @@ export class FeedJobsService {
         // Sort by score descending and take top 500
         const top = scored.sort((a, b) => b.score - a.score).slice(0, 500);
 
-        // Add all posts in this cluster to the global geospatial index (avoid duplicates)
+        // Add all posts in this cluster to the global geospatial index and save their score
         for (const post of top) {
           const lat = post.latitude;
           const lon = post.longitude;
@@ -140,6 +140,14 @@ export class FeedJobsService {
             latitude: lat,
             member: post.id.toString(),
           });
+
+          // Save score in a sorted set
+          await this.redisClient.zAdd('trending:geoindex:scores', [
+            {
+              score: post.score,
+              value: post.id.toString(),
+            },
+          ]);
         }
       }
       // Set TTL for the geospatial index key
