@@ -227,10 +227,7 @@ export class FeedJobsService {
       allUserIds.push(...this.extractUserIdsFromMixpanelResponse(body));
 
       // Pagination logic
-      if (
-        body.page_size === undefined ||
-        body.results.length < body.page_size
-      ) {
+      if (!body.results || body.results.length === 0) {
         keepGoing = false;
       } else {
         session_id = body.session_id;
