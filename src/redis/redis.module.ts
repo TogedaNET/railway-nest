@@ -11,7 +11,7 @@ import { createClient } from 'redis';
       useFactory: async (configService: ConfigService) => {
         const client = createClient({
           url: configService.get<string>('REDISURL'),
-          socket: { tls: true },
+          socket: { tls: true, keepAlive: 1 },
         });
         client.on('error', (err) => console.error('Redis Client Error', err));
         client.on('end', () => console.warn('Redis connection closed'));
