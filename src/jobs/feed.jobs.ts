@@ -114,7 +114,7 @@ export class FeedJobsService {
       const clusters: Record<
         string,
         {
-          id: number;
+          id: string;
           latitude: number;
           longitude: number;
           created_at: string;
@@ -136,6 +136,17 @@ export class FeedJobsService {
       const geoKey = 'trending:geoindex';
       const geoTTLSeconds = 60 * 60 * 24; // 24 hour
       for (const [, clusterPosts] of Object.entries(clusters)) {
+        const postIds = clusterPosts.map((post) => post.id);
+        const viewCounts = await this.redisClient.hmGet(
+          'analytics:post:views',
+          postIds,
+        );
+        // Create a map for easier lookup
+        const viewCountMap = postIds.reduce((map, postId, index) => {
+          map[postId] = Number(viewCounts[index]) || 0;
+          return map;
+        }, {});
+
         const scored = clusterPosts.map((post) => {
           // Timing score: 1 / (hours since created + 1)
           const hoursSinceCreated = Math.abs(
@@ -145,7 +156,9 @@ export class FeedJobsService {
           // Boost for partners
           const boost = post.user_role === 'partner' ? 2 : 1;
           // Popularity score: number of participants
-          const popularityScore = Number(post.participant_count) || 0;
+          const participantCount = Number(post.participant_count) || 0;
+          const viewCount = viewCountMap[post.id] || 0;
+          const popularityScore = participantCount + viewCount * 0.02; // 1 view equals 1 participant
           return {
             ...post,
             score: timingScore * boost + popularityScore,
