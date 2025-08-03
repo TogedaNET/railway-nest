@@ -4,6 +4,7 @@ import { ScheduleModule } from '@nestjs/schedule';
 import { FeedJobsService } from './jobs/feed.jobs';
 import { HttpModule } from '@nestjs/axios';
 import { RedisModule } from './redis/redis.module';
+// import { FeedTestController } from './feed-test.controller';
 
 @Module({
   imports: [
@@ -12,6 +13,7 @@ import { RedisModule } from './redis/redis.module';
     ScheduleModule.forRoot(),
     HttpModule,
   ],
+  // controllers: [FeedTestController],
   providers: [FeedJobsService],
 })
 export class AppModule {}

@@ -210,6 +210,10 @@ export class FeedJobsService {
 
   async fetchAllMixpanelCohortUsers(): Promise<string[]> {
     const apiKey = process.env.MIXPANEL_API_KEY;
+    if (!apiKey) {
+      throw new Error('MIXPANEL_API_KEY environment variable is not set');
+    }
+
     const url = 'https://eu.mixpanel.com/api/query/engage?project_id=3497684';
     const headers = {
       accept: 'application/json',
@@ -224,30 +228,52 @@ export class FeedJobsService {
     let keepGoing = true;
 
     while (keepGoing) {
-      let postData = data;
-      if (session_id !== undefined) {
-        postData += `&session_id=${session_id}&page=${page}`;
-      }
-      const response$ = this.httpService.post<MixpanelEngageResponse>(
-        url,
-        postData,
-        { headers },
-      );
-      const response = await firstValueFrom(response$);
-      const body = response.data;
+      try {
+        let postData = data;
+        if (session_id !== undefined) {
+          postData += `&session_id=${session_id}&page=${page}`;
+        }
+        
+        const response$ = this.httpService.post<MixpanelEngageResponse>(
+          url,
+          postData,
+          { 
+            headers,
+            timeout: 30000, // 30 second timeout
+          },
+        );
 
-      // Extract user IDs from this page
-      allUserIds.push(...this.extractUserIdsFromMixpanelResponse(body));
+        const response = await firstValueFrom(response$);
+        
+        // Check if response is successful
+        if (response.status !== 200) {
+          throw new Error(`Mixpanel API returned status ${response.status}: ${response.statusText}`);
+        }
 
-      // Pagination logic
-      if (!body.results || body.results.length === 0) {
-        keepGoing = false;
-      } else {
-        session_id = body.session_id;
-        page = body.page + 1;
-      }
+        const body = response.data;
+        
+        // Validate response structure
+        if (!body || typeof body !== 'object') {
+          throw new Error('Invalid response from Mixpanel API: response is not an object');
+        }
+
+        // Extract user IDs from this page
+        const pageUserIds = this.extractUserIdsFromMixpanelResponse(body);
+        allUserIds.push(...pageUserIds);
+
+        // Pagination logic
+        if (!body.results || body.results.length === 0) {
+          keepGoing = false;
+        } else {
+          session_id = body.session_id;
+          page = body.page + 1;
+        }
+
+      } catch (error) {
+        this.logger.error(`Error fetching Mixpanel users:`, error.message);
+        }
+
     }
-
     return allUserIds;
   }
 
@@ -285,9 +311,9 @@ export class FeedJobsService {
   async prePopulateUserFeedsInRange(postId: string) {
     this.logger.log('prePopulateUserFeedsInRange called');
     try {
-      // Fetch post location
+      // Fetch post location and user_current_location
       const { rows: postRows } = await this.pgPool.query(
-        'SELECT latitude, longitude FROM post WHERE id = $1',
+        'SELECT latitude, longitude, ST_Y(user_current_location::geometry) as current_lat, ST_X(user_current_location::geometry) as current_lon FROM post WHERE id = $1',
         [postId],
       );
       if (!postRows.length) {
@@ -296,6 +322,8 @@ export class FeedJobsService {
       }
       const postLat = postRows[0].latitude;
       const postLon = postRows[0].longitude;
+      const postCurrentLat = postRows[0].current_lat;
+      const postCurrentLon = postRows[0].current_lon;
       if (postLat == null || postLon == null) {
         this.logger.error(`Post ${postId} missing coordinates`);
         return;
@@ -308,16 +336,30 @@ export class FeedJobsService {
         'SELECT id, latitude, longitude FROM user_info WHERE id = ANY($1)',
         [userIds],
       );
-      // Filter users within 500km
+      
+      // Filter users within 500km of post location OR if post was created around user's current location
       const filteredUserIds = users
-        .filter(
-          (u) =>
-            u.latitude != null &&
-            u.longitude != null &&
-            this.haversine(postLat, postLon, u.latitude, u.longitude) < 500,
-        )
+        .filter((u) => {
+          if (u.latitude == null || u.longitude == null) return false;
+          
+          const distanceToPost = this.haversine(postLat, postLon, u.latitude, u.longitude);
+          
+          // Include if within 500km of post location
+          if (distanceToPost < 500) return true;
+          
+          // Include if post was created around user's current location (50km radius)
+          if (postCurrentLat != null && postCurrentLon != null) {
+            // Check if post was created within 500km of user's current location
+            const distanceToUserCurrentLocation = this.haversine(postCurrentLat, postCurrentLon, u.latitude, u.longitude);
+            if (distanceToUserCurrentLocation < 50) {
+              return true;
+            }
+          }
+          
+          return false;
+        })
         .map((u) => u.id);
-      this.logger.log(`Users within 500km: ${filteredUserIds.length}`);
+      this.logger.log(`Users within 500km or post created around user: ${filteredUserIds.length}`);
 
       await this.cachePersonalizedFeedForAllUsers(filteredUserIds);
       this.logger.log(`prePopulateUserFeedsInRange finished`);
@@ -403,12 +445,14 @@ export class FeedJobsService {
     // 2. Fetch all posts and their data
     const { rows: posts } = await this.pgPool.query(`
       SELECT p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, p.club_id,
-             COUNT(pp.id) AS participant_count
+             COUNT(pp.id) AS participant_count,
+             ST_Y(p.user_current_location::geometry) as current_lat,
+             ST_X(p.user_current_location::geometry) as current_lon
       FROM post p
       JOIN user_info ui ON p.user_id = ui.id
       LEFT JOIN post_participant pp ON p.id = pp.post_id
       WHERE p.status = 'NOT_STARTED'
-      GROUP BY p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, p.club_id
+      GROUP BY p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, p.club_id, p.user_current_location
     `);
 
     // Post interests
@@ -493,6 +537,20 @@ export class FeedJobsService {
         // Boost for partner
         const boost = post.user_role === 'partner' ? 2 : 1;
 
+        // Bonus for posts created around current user location (50km radius)
+        let currentLocationBonus = 0;
+        if (post.current_lat && post.current_lon) {
+          const postCreationLocationDistanceToCurrentUser = this.haversine(
+            userLat,
+            userLon,
+            post.current_lat,
+            post.current_lon,
+          );
+          if (postCreationLocationDistanceToCurrentUser < 50) {
+            currentLocationBonus = 3; // Significant boost for posts created near user
+          }
+        }
+
         // Final score (tune weights as needed)
         const score =
           locationScore * 2 +
@@ -502,7 +560,8 @@ export class FeedJobsService {
           friendWithOwnerScore * 2 +
           friendsWithParticipantsScore * 1 +
           clubParticipantScore * 1 +
-          boost;
+          boost +
+          currentLocationBonus;
 
         return { postId: post.id, score };
       });
