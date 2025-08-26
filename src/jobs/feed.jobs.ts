@@ -102,7 +102,7 @@ export class FeedJobsService {
       return;
     }
 
-    const allowedTypes = new Set(['ONE_DAY']);
+    const allowedTypes = new Set(['one_day']);
     const postId = parsed?.postId;
     const type = parsed?.type;
     const timestamp = parsed?.timestamp;
