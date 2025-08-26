@@ -123,14 +123,14 @@ export class FeedJobsService {
     };
 
     try {
-      await this.redisClient.lPush(
-        'post:boosted',
-        JSON.stringify(eventToStore),
-      );
       if (type === 'one_day') {
-        await this.redisClient.set(`post:boosted:${String(postId)}`, '1', {
-          EX: ONE_DAY_IN_SECONDS,
-        });
+        await this.redisClient.set(
+          `post:boosted:${String(postId)}`,
+          JSON.stringify(eventToStore),
+          {
+            EX: ONE_DAY_IN_SECONDS,
+          },
+        );
       }
       this.logger.log(`Stored post.boosted event for post ${postId}`);
     } catch (err) {
