@@ -29,6 +29,8 @@ interface MixpanelEngageResponse {
   computed_at: string;
 }
 
+const ONE_DAY_IN_SECONDS = 60 * 60 * 24;
+
 @Injectable()
 export class FeedJobsService {
   private readonly logger = new Logger(FeedJobsService.name, {
@@ -65,7 +67,11 @@ export class FeedJobsService {
     await this.redisSubscriber.subscribe('post.created', async (message) => {
       await this.handlePostCreatedEvent(message);
     });
+    await this.redisSubscriber.subscribe('post.boosted', async (message) => {
+      await this.handlePostBoostedEvent(message);
+    });
     this.logger.log('Subscribed to Redis channel: post.created');
+    this.logger.log('Subscribed to Redis channel: post.boosted');
   }
 
   private async handlePostCreatedEvent(message: string) {
@@ -78,12 +84,58 @@ export class FeedJobsService {
       this.logger.error('Failed to parse post.created event message', e);
       return;
     }
-    this.logger.log('Parsed postEvent:', postEvent);
     if (!postEvent || !postEvent.postId) {
       this.logger.error('post.created event missing postId');
       return;
     }
     await this.prePopulateUserFeedsInRange(postEvent.postId);
+  }
+
+  private async handlePostBoostedEvent(message: string) {
+    this.logger.log(`Received post.boosted event: ${message}`);
+    let parsed: any;
+    try {
+      parsed =
+        typeof message === 'string' ? JSON.parse(JSON.parse(message)) : message;
+    } catch (e) {
+      this.logger.error('Failed to parse post.boosted event message', e);
+      return;
+    }
+
+    const allowedTypes = new Set(['ONE_DAY']);
+    const postId = parsed?.postId;
+    const type = parsed?.type;
+    const timestamp = parsed?.timestamp;
+
+    if (!postId) {
+      this.logger.error('post.boosted event missing postId');
+      return;
+    }
+    if (!allowedTypes.has(type)) {
+      this.logger.error(`post.boosted event has invalid type: ${type}`);
+      return;
+    }
+
+    const eventToStore = {
+      postId: String(postId),
+      type,
+      timestamp: Number(timestamp),
+    };
+
+    try {
+      await this.redisClient.lPush(
+        'post:boosted',
+        JSON.stringify(eventToStore),
+      );
+      if (type === 'ONE_DAY') {
+        await this.redisClient.expire('post:boosted', ONE_DAY_IN_SECONDS);
+      }
+      this.logger.log(`Stored post.boosted event for post ${postId}`);
+    } catch (err) {
+      this.logger.error('Failed saving post.boosted event to Redis', err);
+      return;
+    }
+    await this.prePopulateUserFeedsInRange(eventToStore.postId);
   }
 
   @Cron(CronExpression.EVERY_DAY_AT_2AM)
@@ -134,7 +186,6 @@ export class FeedJobsService {
       // 3. For each cluster, score posts by timing, partner boost, and popularity, and store top 500 in Redis
       // Also add all trending posts to a global geospatial index with TTL
       const geoKey = 'trending:geoindex';
-      const geoTTLSeconds = 60 * 60 * 24; // 24 hour
       for (const [, clusterPosts] of Object.entries(clusters)) {
         const postIds = clusterPosts.map((post) => post.id);
         const viewCounts = await this.redisClient.hmGet(
@@ -198,7 +249,7 @@ export class FeedJobsService {
         }
       }
       // Set TTL for the geospatial index key
-      await this.redisClient.expire(geoKey, geoTTLSeconds);
+      await this.redisClient.expire(geoKey, ONE_DAY_IN_SECONDS);
 
       this.logger.log('Trending posts updated in Redis by geohash clusters');
     } catch (error) {
@@ -233,28 +284,32 @@ export class FeedJobsService {
         if (session_id !== undefined) {
           postData += `&session_id=${session_id}&page=${page}`;
         }
-        
+
         const response$ = this.httpService.post<MixpanelEngageResponse>(
           url,
           postData,
-          { 
+          {
             headers,
             timeout: 30000, // 30 second timeout
           },
         );
 
         const response = await firstValueFrom(response$);
-        
+
         // Check if response is successful
         if (response.status !== 200) {
-          throw new Error(`Mixpanel API returned status ${response.status}: ${response.statusText}`);
+          throw new Error(
+            `Mixpanel API returned status ${response.status}: ${response.statusText}`,
+          );
         }
 
         const body = response.data;
-        
+
         // Validate response structure
         if (!body || typeof body !== 'object') {
-          throw new Error('Invalid response from Mixpanel API: response is not an object');
+          throw new Error(
+            'Invalid response from Mixpanel API: response is not an object',
+          );
         }
 
         // Extract user IDs from this page
@@ -268,11 +323,9 @@ export class FeedJobsService {
           session_id = body.session_id;
           page = body.page + 1;
         }
-
       } catch (error) {
         this.logger.error(`Error fetching Mixpanel users:`, error.message);
-        }
-
+      }
     }
     return allUserIds;
   }
@@ -336,30 +389,42 @@ export class FeedJobsService {
         'SELECT id, latitude, longitude FROM user_info WHERE id = ANY($1)',
         [userIds],
       );
-      
+
       // Filter users within 500km of post location OR if post was created around user's current location
       const filteredUserIds = users
         .filter((u) => {
           if (u.latitude == null || u.longitude == null) return false;
-          
-          const distanceToPost = this.haversine(postLat, postLon, u.latitude, u.longitude);
-          
+
+          const distanceToPost = this.haversine(
+            postLat,
+            postLon,
+            u.latitude,
+            u.longitude,
+          );
+
           // Include if within 500km of post location
           if (distanceToPost < 500) return true;
-          
+
           // Include if post was created around user's current location (50km radius)
           if (postCurrentLat != null && postCurrentLon != null) {
             // Check if post was created within 500km of user's current location
-            const distanceToUserCurrentLocation = this.haversine(postCurrentLat, postCurrentLon, u.latitude, u.longitude);
+            const distanceToUserCurrentLocation = this.haversine(
+              postCurrentLat,
+              postCurrentLon,
+              u.latitude,
+              u.longitude,
+            );
             if (distanceToUserCurrentLocation < 50) {
               return true;
             }
           }
-          
+
           return false;
         })
         .map((u) => u.id);
-      this.logger.log(`Users within 500km or post created around user: ${filteredUserIds.length}`);
+      this.logger.log(
+        `Users within 500km or post created/boosted around user: ${filteredUserIds.length}`,
+      );
 
       await this.cachePersonalizedFeedForAllUsers(filteredUserIds);
       this.logger.log(`prePopulateUserFeedsInRange finished`);
@@ -477,6 +542,23 @@ export class FeedJobsService {
 
     const redisOps: Array<{ key: string; value: any }> = [];
 
+    // Read boosted posts list once and build a Set of boosted IDs
+    let boostedIds = new Set<string>();
+    try {
+      const boostedItems = await this.redisClient.lRange('post:boosted', 0, -1);
+      const boostedIdsArray = (boostedItems || []).map((item) => {
+        try {
+          const parsed = JSON.parse(item);
+          return String(parsed?.postId ?? item);
+        } catch (_) {
+          return String(item);
+        }
+      });
+      boostedIds = new Set(boostedIdsArray);
+    } catch (e) {
+      this.logger.error('Failed to read boosted posts from Redis', e);
+    }
+
     // 3. For each user, score only posts within 500km (concurrently)
     for (const userId of userIds) {
       const user = userMap[userId];
@@ -534,8 +616,9 @@ export class FeedJobsService {
         const clubParticipantScore =
           post.club_id && userClubsSet.has(post.club_id) ? 1 : 0;
 
-        // Boost for partner
+        // Boost factors
         const boost = post.user_role === 'partner' ? 2 : 1;
+        const boostedBonus = boostedIds.has(String(post.id)) ? 3 : 0;
 
         // Bonus for posts created around current user location (50km radius)
         let currentLocationBonus = 0;
@@ -561,6 +644,7 @@ export class FeedJobsService {
           friendsWithParticipantsScore * 1 +
           clubParticipantScore * 1 +
           boost +
+          boostedBonus +
           currentLocationBonus;
 
         return { postId: post.id, score };
