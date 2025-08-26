@@ -127,8 +127,10 @@ export class FeedJobsService {
         'post:boosted',
         JSON.stringify(eventToStore),
       );
-      if (type === 'ONE_DAY') {
-        await this.redisClient.expire('post:boosted', ONE_DAY_IN_SECONDS);
+      if (type === 'one_day') {
+        await this.redisClient.set(`post:boosted:${String(postId)}`, '1', {
+          EX: ONE_DAY_IN_SECONDS,
+        });
       }
       this.logger.log(`Stored post.boosted event for post ${postId}`);
     } catch (err) {
@@ -542,21 +544,21 @@ export class FeedJobsService {
 
     const redisOps: Array<{ key: string; value: any }> = [];
 
-    // Read boosted posts list once and build a Set of boosted IDs
+    // Read boosted post keys once and build a Set of boosted IDs
     let boostedIds = new Set<string>();
     try {
-      const boostedItems = await this.redisClient.lRange('post:boosted', 0, -1);
-      const boostedIdsArray = (boostedItems || []).map((item) => {
-        try {
-          const parsed = JSON.parse(item);
-          return String(parsed?.postId ?? item);
-        } catch (_) {
-          return String(item);
-        }
-      });
-      boostedIds = new Set(boostedIdsArray);
+      const keys: string[] = [];
+      // node-redis v4 scanIterator is available on the client
+      for await (const key of (this.redisClient as any).scanIterator({
+        MATCH: 'post:boosted:*',
+      })) {
+        keys.push(String(key));
+      }
+      boostedIds = new Set(
+        keys.map((k) => k.substring('post:boosted:'.length)),
+      );
     } catch (e) {
-      this.logger.error('Failed to read boosted posts from Redis', e);
+      this.logger.error('Failed to scan boosted post keys from Redis', e);
     }
 
     // 3. For each user, score only posts within 500km (concurrently)
