@@ -4,6 +4,7 @@ import * as pino from 'pino';
 
 export class PinoLoggerService implements LoggerService {
     private logger: any;
+    private serviceName: string = 'railway-nest';
 
     constructor() {
         const token = process.env.BETTER_STACK_TOKEN;
@@ -30,23 +31,23 @@ export class PinoLoggerService implements LoggerService {
         this.logger = pino(transport);
     }
 
-    log(message: any, ...optionalParams: any[]) {
-        this.logger.info(message, ...optionalParams);
+    log(message: any) {
+        this.logger.info({ message, service: this.serviceName });
     }
 
-    error(message: any, ...optionalParams: any[]) {
-        this.logger.error(message, ...optionalParams);
+    error(message: any) {
+        this.logger.error({ message, service: this.serviceName });
     }
 
-    warn(message: any, ...optionalParams: any[]) {
-        this.logger.warn(message, ...optionalParams);
+    warn(message: any) {
+        this.logger.warn({ message, service: this.serviceName });
     }
 
-    debug(message: any, ...optionalParams: any[]) {
-        this.logger.debug(message, ...optionalParams);
+    debug(message: any) {
+        this.logger.debug({ message, service: this.serviceName });
     }
 
-    verbose(message: any, ...optionalParams: any[]) {
-        this.logger.trace(message, ...optionalParams);
+    verbose(message: any) {
+        this.logger.trace({ message, service: this.serviceName });
     }
 }
