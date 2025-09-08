@@ -131,6 +131,8 @@ export class FeedJobsService {
             EX: ONE_DAY_IN_SECONDS,
           },
         );
+      } else {
+        this.logger.warn("unknown type of boost event: ", type);
       }
       this.logger.log(`Stored post.boosted event for post ${postId}`);
     } catch (err) {
@@ -185,6 +187,9 @@ export class FeedJobsService {
         clusters[hash].push(post);
       }
 
+      // todo could be improved to not get all boosted posts?
+      let boostedIds = await this.getBoostedPostsFromRedis();
+
       // 3. For each cluster, score posts by timing, partner boost, and popularity, and store top 500 in Redis
       // Also add all trending posts to a global geospatial index with TTL
       const geoKey = 'trending:geoindex';
@@ -201,20 +206,18 @@ export class FeedJobsService {
         }, {});
 
         const scored = clusterPosts.map((post) => {
-          // Timing score: 1 / (hours since created + 1)
-          const hoursSinceCreated = Math.abs(
-            dayjs().diff(dayjs(post.created_at), 'hour'),
+          const daysSinceCreated = Math.abs(
+            dayjs().diff(dayjs(post.created_at), 'day'),
           );
-          const timingScore = 1 / (hoursSinceCreated + 1);
-          // Boost for partners
-          const boost = post.user_role === 'partner' ? 2 : 1;
+          const timingScore = 50 / (daysSinceCreated + 1);
+          const boostedBonus = boostedIds.has(String(post.id)) ? 2 : 1;
           // Popularity score: number of participants
           const participantCount = Number(post.participant_count) || 0;
           const viewCount = viewCountMap[post.id] || 0;
-          const popularityScore = participantCount + viewCount * 0.02; // 1 view equals 1 participant
+          const popularityScore = Math.min((participantCount * 0.5) + (viewCount * 0.02), 50);
           return {
             ...post,
-            score: timingScore * boost + popularityScore,
+            score: (timingScore + popularityScore) * boostedBonus,
           };
         });
         // Sort by score descending and take top 500
@@ -446,9 +449,9 @@ export class FeedJobsService {
     const a =
       Math.sin(dLat / 2) * Math.sin(dLat / 2) +
       Math.cos(toRad(lat1)) *
-        Math.cos(toRad(lat2)) *
-        Math.sin(dLon / 2) *
-        Math.sin(dLon / 2);
+      Math.cos(toRad(lat2)) *
+      Math.sin(dLon / 2) *
+      Math.sin(dLon / 2);
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
   }
@@ -545,21 +548,7 @@ export class FeedJobsService {
     const redisOps: Array<{ key: string; value: any }> = [];
 
     // Read boosted post keys once and build a Set of boosted IDs
-    let boostedIds = new Set<string>();
-    try {
-      const keys: string[] = [];
-      // node-redis v4 scanIterator is available on the client
-      for await (const key of (this.redisClient as any).scanIterator({
-        MATCH: 'post:boosted:*',
-      })) {
-        keys.push(String(key));
-      }
-      boostedIds = new Set(
-        keys.map((k) => k.substring('post:boosted:'.length)),
-      );
-    } catch (e) {
-      this.logger.error('Failed to scan boosted post keys from Redis', e);
-    }
+    let boostedIds = await this.getBoostedPostsFromRedis();
 
     // 3. For each user, score only posts within 500km (concurrently)
     for (const userId of userIds) {
@@ -582,72 +571,68 @@ export class FeedJobsService {
         return distance < 500;
       });
 
+      const postIds = nearbyPosts.map((post) => post.id);
+      const viewCounts = await this.redisClient.hmGet(
+        'analytics:post:views',
+        postIds,
+      );
+      // Create a map for easier lookup
+      const viewCountMap = postIds.reduce((map, postId, index) => {
+        map[postId] = Number(viewCounts[index]) || 0;
+        return map;
+      }, {});
+
       const scoredPosts = nearbyPosts.map((post) => {
         // Location score (closer = higher, e.g., 1 / (distance_km + 1))
+
+
         const distance = this.haversine(
           userLat,
           userLon,
           post.latitude,
           post.longitude,
         );
-        const locationScore = 1 / (distance + 1);
+        const locationScore = Math.max(0, 20 - (distance / 500) * 20);
 
         // Timing score
-        const hoursSinceCreated = Math.abs(
-          dayjs().diff(dayjs(post.created_at), 'hour'),
+        const daysSinceCreated = Math.abs(
+          dayjs().diff(dayjs(post.created_at), 'day'),
         );
-        const timingScore = 1 / (hoursSinceCreated + 1);
+        const timingScore = 20 / (daysSinceCreated + 1);
 
-        // Participant number
-        const participantScore = Number(post.participant_count) || 0;
+        const participantCount = Number(post.participant_count) || 0;
+        const viewCount = viewCountMap[post.id] || 0;
+        const popularityScore = Math.min((participantCount * 0.5) + (viewCount * 0.02), 10);
 
         // Jaccard index for interests
         const postInterestsSet = postInterestMap[post.id] || new Set();
-        const jaccardScore = this.jaccard(userInterestsSet, postInterestsSet);
+        const jaccardScore = this.jaccard(userInterestsSet, postInterestsSet) * 10;
 
         // Friend with owner
-        const friendWithOwnerScore = userFriendsSet.has(post.user_id) ? 1 : 0;
+        const friendWithOwnerScore = userFriendsSet.has(post.user_id) ? 15 : 0;
 
         // Friends with participants
         const postParticipantsSet = postParticipantMap[post.id] || new Set();
-        const friendsWithParticipantsScore = [...postParticipantsSet].filter(
+        const friendsWithParticipantsScore = Math.min([...postParticipantsSet].filter(
           (pid) => userFriendsSet.has(pid),
-        ).length;
+        ).length, 15);
 
         // Participant of club
         const clubParticipantScore =
-          post.club_id && userClubsSet.has(post.club_id) ? 1 : 0;
+          post.club_id && userClubsSet.has(post.club_id) ? 15 : 0;
 
         // Boost factors
-        const boost = post.user_role === 'partner' ? 2 : 1;
-        const boostedBonus = boostedIds.has(String(post.id)) ? 3 : 0;
-
-        // Bonus for posts created around current user location (50km radius)
-        let currentLocationBonus = 0;
-        if (post.current_lat && post.current_lon) {
-          const postCreationLocationDistanceToCurrentUser = this.haversine(
-            userLat,
-            userLon,
-            post.current_lat,
-            post.current_lon,
-          );
-          if (postCreationLocationDistanceToCurrentUser < 50) {
-            currentLocationBonus = 3; // Significant boost for posts created near user
-          }
-        }
+        const boostedBonus = boostedIds.has(String(post.id)) ? 2 : 1;
 
         // Final score (tune weights as needed)
         const score =
-          locationScore * 2 +
-          timingScore * 2 +
-          participantScore * 1 +
-          jaccardScore * 3 +
-          friendWithOwnerScore * 2 +
-          friendsWithParticipantsScore * 1 +
-          clubParticipantScore * 1 +
-          boost +
-          boostedBonus +
-          currentLocationBonus;
+          (locationScore +
+            timingScore +
+            popularityScore +
+            jaccardScore +
+            friendWithOwnerScore +
+            friendsWithParticipantsScore +
+            clubParticipantScore) * boostedBonus;
 
         return { postId: post.id, score };
       });
@@ -674,5 +659,24 @@ export class FeedJobsService {
       pipeline.set(op.key, JSON.stringify(op.value), { EX: 60 * 60 * 24 * 3 }); // 3 days ttl
     }
     await pipeline.exec();
+  }
+
+  private async getBoostedPostsFromRedis() {
+    let boostedIds = new Set<string>();
+    try {
+      const keys: string[] = [];
+      // node-redis v4 scanIterator is available on the client
+      for await (const key of (this.redisClient as any).scanIterator({
+        MATCH: 'post:boosted:*',
+      })) {
+        keys.push(String(key));
+      }
+      boostedIds = new Set(
+        keys.map((k) => k.substring('post:boosted:'.length))
+      );
+    } catch (e) {
+      this.logger.error('Failed to scan boosted post keys from Redis', e);
+    }
+    return boostedIds;
   }
 }
