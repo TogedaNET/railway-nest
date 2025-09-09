@@ -142,7 +142,7 @@ export class FeedJobsService {
     await this.prePopulateUserFeedsInRange(eventToStore.postId);
   }
 
-  @Cron(CronExpression.EVERY_DAY_AT_2AM)
+  @Cron(CronExpression.EVERY_6_HOURS)
   async updateTrendingPosts() {
     if (this.isRunning) {
       this.logger.warn(
@@ -157,7 +157,9 @@ export class FeedJobsService {
       // 1. Fetch all posts with status 'NOT_STARTED', creation date, user_id, user_role, and participant count
       const { rows: posts } = await this.pgPool.query(
         `SELECT p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, 
-                COUNT(pp.id) AS participant_count
+                COUNT(pp.id) AS participant_count,
+                ST_Y(p.user_current_location::geometry) as current_lat, 
+                ST_X(p.user_current_location::geometry) as current_lon
          FROM post p
          JOIN user_info ui ON p.user_id = ui.id
          LEFT JOIN post_participant pp ON p.id = pp.post_id
@@ -188,13 +190,27 @@ export class FeedJobsService {
       }
 
       // todo could be improved to not get all boosted posts?
-      let boostedIds = await this.getBoostedPostsFromRedis();
+      const boostedIds = await this.getBoostedPostsFromRedis();
 
       // 3. For each cluster, score posts by timing, partner boost, and popularity, and store top 500 in Redis
       // Also add all trending posts to a global geospatial index with TTL
       const geoKey = 'trending:geoindex';
-      for (const [, clusterPosts] of Object.entries(clusters)) {
-        const postIds = clusterPosts.map((post) => post.id);
+      for (const [clusterHash, clusterPosts] of Object.entries(clusters)) {
+        // get travel events created from inside this cluster.
+        const travelPosts = posts.filter(post => {
+          if (!post.current_lat || !post.current_lon) return false;
+          const hash = ngeohash.encode(post.current_lat, post.current_lon, precision);
+          this.logger.log(`Current cluster hash: ${clusterHash}`)
+          this.logger.log(`Current hash of event with current_lat and current_lon: ${hash}`)
+          if (hash === clusterHash) {
+            this.logger.log('Same hash!');
+            return true; // remove log and refactor with 1 liners
+          }
+          return false;
+
+        });
+        const postsCombined = new Set([...clusterPosts, ...travelPosts]);
+        const postIds = Array.from(postsCombined).map((post) => post.id);
         const viewCounts = await this.redisClient.hmGet(
           'analytics:post:views',
           postIds,
@@ -205,7 +221,7 @@ export class FeedJobsService {
           return map;
         }, {});
 
-        const scored = clusterPosts.map((post) => {
+        const scored = Array.from(postsCombined).map((post) => {
           const daysSinceCreated = Math.abs(
             dayjs().diff(dayjs(post.created_at), 'day'),
           );
@@ -344,7 +360,7 @@ export class FeedJobsService {
     );
   }
 
-  @Cron(CronExpression.EVERY_6_HOURS)
+  @Cron(CronExpression.EVERY_DAY_AT_2AM)
   async prePopulateAllActiveUsersFeeds() {
     if (this.isRunning2) {
       this.logger.warn(
@@ -410,16 +426,15 @@ export class FeedJobsService {
           // Include if within 500km of post location
           if (distanceToPost < 500) return true;
 
-          // Include if post was created around user's current location (50km radius)
+          // Include if post was created around user's current location (500km radius)
           if (postCurrentLat != null && postCurrentLon != null) {
-            // Check if post was created within 500km of user's current location
             const distanceToUserCurrentLocation = this.haversine(
               postCurrentLat,
               postCurrentLon,
               u.latitude,
               u.longitude,
             );
-            if (distanceToUserCurrentLocation < 50) {
+            if (distanceToUserCurrentLocation < 500) {
               return true;
             }
           }
@@ -428,7 +443,7 @@ export class FeedJobsService {
         })
         .map((u) => u.id);
       this.logger.log(
-        `Users within 500km or post created/boosted around user: ${filteredUserIds.length}`,
+        `Users within 500km or post created/boosted around number of users: ${filteredUserIds.length}`,
       );
 
       await this.cachePersonalizedFeedForAllUsers(filteredUserIds);
@@ -513,7 +528,7 @@ export class FeedJobsService {
     }
 
     // 2. Fetch all posts and their data
-    const { rows: posts } = await this.pgPool.query(`
+    const { rows: allPosts } = await this.pgPool.query(`
       SELECT p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, p.club_id,
              COUNT(pp.id) AS participant_count,
              ST_Y(p.user_current_location::geometry) as current_lat,
@@ -561,7 +576,7 @@ export class FeedJobsService {
       const userClubsSet = userClubMap[userId] || new Set();
 
       // Filter posts within 500km
-      const nearbyPosts = posts.filter((post) => {
+      const nearbyPosts = allPosts.filter((post) => {
         const distance = this.haversine(
           userLat,
           userLon,
@@ -571,7 +586,21 @@ export class FeedJobsService {
         return distance < 500;
       });
 
-      const postIds = nearbyPosts.map((post) => post.id);
+      const nearbyCreatedPosts = allPosts.filter((post) => {
+        if (post.current_lat && post.current_lon) {
+          const distance = this.haversine(
+            userLat,
+            userLon,
+            post.current_lat,
+            post.current_lon,
+          );
+          return distance < 500
+        }
+        return false;
+      });
+
+      const postsCombined = Array.from(new Set([...nearbyPosts, ...nearbyCreatedPosts]));
+      const postIds = postsCombined.map((post) => post.id);
       let viewCounts: string[];
       if (postIds.length !== 0) {
         viewCounts = await this.redisClient.hmGet(
@@ -585,16 +614,22 @@ export class FeedJobsService {
         return map;
       }, {});
 
-      const scoredPosts = nearbyPosts.map((post) => {
-        // Location score (closer = higher, e.g., 1 / (distance_km + 1))
+      const scoredPosts = postsCombined.map((post) => {
 
-
-        const distance = this.haversine(
+        let distance = this.haversine(
           userLat,
           userLon,
           post.latitude,
           post.longitude,
         );
+        if (distance > 500 && post.current_lat && post.current_lon) { // travel post
+          distance = Math.min(500, this.haversine(
+            userLat,
+            userLon,
+            post.current_lat,
+            post.current_lon,
+          ));
+        }
         const locationScore = Math.max(0, 20 - (distance / 500) * 20);
 
         // Timing score
