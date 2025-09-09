@@ -35,8 +35,8 @@ export class PinoLoggerService implements LoggerService {
         this.logger.info({ message, app: this.serviceName });
     }
 
-    error(message: any) {
-        this.logger.error({ message, app: this.serviceName });
+    error(message: any, error: any) {
+        this.logger.error({ message, app: this.serviceName, error });
     }
 
     warn(message: any) {

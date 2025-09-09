@@ -572,10 +572,13 @@ export class FeedJobsService {
       });
 
       const postIds = nearbyPosts.map((post) => post.id);
-      const viewCounts = await this.redisClient.hmGet(
-        'analytics:post:views',
-        postIds,
-      );
+      let viewCounts: string[];
+      if (postIds.length !== 0) {
+        viewCounts = await this.redisClient.hmGet(
+          'analytics:post:views',
+          postIds,
+        );
+      }
       // Create a map for easier lookup
       const viewCountMap = postIds.reduce((map, postId, index) => {
         map[postId] = Number(viewCounts[index]) || 0;
