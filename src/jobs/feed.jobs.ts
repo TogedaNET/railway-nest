@@ -407,7 +407,7 @@ export class FeedJobsService {
 
       // Fetch user locations
       const { rows: users } = await this.pgPool.query(
-        'SELECT id, latitude, longitude FROM user_info WHERE id = ANY($1)',
+        'SELECT id, COALESCE(ST_Y(user_last_known_location::geometry), latitude) as latitude, COALESCE(ST_Y(user_last_known_location::geometry), longitude) as longitude, FROM user_info WHERE id = ANY($1)',
         [userIds],
       );
 
