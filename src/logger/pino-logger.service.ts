@@ -8,26 +8,29 @@ export class PinoLoggerService implements LoggerService {
 
     constructor() {
         const token = process.env.BETTER_STACK_TOKEN;
-        const transport = pino.transport({
-            targets: [
-                {
-                    target: "@logtail/pino",
+        const targets = [];
+
+        if (token) {
+            targets.push({
+                target: "@logtail/pino",
+                options: {
+                    sourceToken: token,
                     options: {
-                        sourceToken: token,
-                        options: {
-                            endpoint: process.env.BETTER_STACK_ENDPOINT
-                        },
+                        endpoint: process.env.BETTER_STACK_ENDPOINT
                     },
                 },
-                {
-                    target: "pino-pretty",
-                    options: {
-                        colorize: true,
-                        translateTime: 'SYS:standard',
-                    },
-                },
-            ],
+            });
+        }
+
+        targets.push({
+            target: "pino-pretty",
+            options: {
+                colorize: true,
+                translateTime: 'SYS:standard',
+            },
         });
+
+        const transport = pino.transport({ targets });
         this.logger = pino(transport);
     }
 
