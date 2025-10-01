@@ -8,6 +8,7 @@ import { firstValueFrom } from 'rxjs';
 import { v4 as uuidv4 } from 'uuid';
 import * as dayjs from 'dayjs';
 import { RedisClientType } from 'redis';
+import { SesService } from 'src/ses/ses.service';
 
 // Type for Mixpanel Engage API response
 interface MixpanelEngageUser {
@@ -45,6 +46,7 @@ export class FeedJobsService {
     private readonly httpService: HttpService,
     @Inject('REDIS_CLIENT')
     private readonly redisClient: RedisClientType<any, any>,
+    private readonly sesService: SesService
   ) {
     this.pgPool = new Pool({
       host: process.env.POSTGRESHOST,
@@ -132,9 +134,12 @@ export class FeedJobsService {
           },
         );
       } else {
-        this.logger.warn("unknown type of boost event: ", type);
+        this.logger.error("unknown type of boost event: ", type);
+        return;
       }
       this.logger.log(`Stored post.boosted event for post ${postId}`);
+      // todo get email to send to from the post owner
+      this.sesService.sendTextEmail("dm.kaloyan@gmail.com", "Post wast boosted", `The boosted post id: ${postId}`)
     } catch (err) {
       this.logger.error('Failed saving post.boosted event to Redis', err);
       return;
