@@ -72,8 +72,12 @@ export class FeedJobsService {
     await this.redisSubscriber.subscribe('post.boosted', async (message) => {
       await this.handlePostBoostedEvent(message);
     });
+    await this.redisSubscriber.subscribe('paymentIntent.succeeded', async (message) => {
+      await this.handlePaymentIntentSucceededEvent(message);
+    });
     this.logger.log('Subscribed to Redis channel: post.created');
     this.logger.log('Subscribed to Redis channel: post.boosted');
+    this.logger.log('Subscribed to Redis channel: paymentIntent.succeeded');
   }
 
   private async handlePostCreatedEvent(message: string) {
@@ -145,6 +149,67 @@ export class FeedJobsService {
       return;
     }
     await this.prePopulateUserFeedsInRange(eventToStore.postId);
+  }
+
+  private async handlePaymentIntentSucceededEvent(message: string) {
+    this.logger.log(`Received paymentIntent.succeeded event: ${message}`);
+    let parsed: any;
+    try {
+      parsed =
+        typeof message === 'string' ? JSON.parse(JSON.parse(message)) : message;
+    } catch (e) {
+      this.logger.error('Failed to parse paymentIntent.succeeded event message', e);
+      return;
+    }
+
+    const postId = parsed?.postId;
+    const userId = parsed?.userId;
+
+    if (!postId || !userId) {
+      this.logger.error('paymentIntent.succeeded event missing postId or userId');
+      return;
+    }
+
+    try {
+      // Fetch post and user information
+      const { rows: postRows } = await this.pgPool.query(
+        'SELECT id, title FROM post WHERE id = $1',
+        [postId],
+      );
+
+      const { rows: userRows } = await this.pgPool.query(
+        'SELECT id, email, name FROM user_info WHERE id = $1',
+        [userId],
+      );
+
+      if (!postRows.length || !userRows.length) {
+        this.logger.warn(`Post or user not found for payment intent event. PostId: ${postId}, UserId: ${userId}`);
+        return;
+      }
+
+      const post = postRows[0];
+      const user = userRows[0];
+
+      // Send email notification
+      await this.sesService.sendHtmlEmail(
+        user.email,
+        `Ticket Confirmed - ${post.title}`,
+        `
+          <h1>Your Ticket is Confirmed!</h1>
+          <p>Hi ${user.name || 'there'},</p>
+          <p>Your payment was successful and your ticket for the following event has been confirmed:</p>
+          <h2>${post.title}</h2>
+          <p><strong>Event ID:</strong> ${post.id}</p>
+          <p>We look forward to seeing you there!</p>
+          <p>Best regards,<br>The Togeda Team</p>
+        `,
+        `Your ticket for "${post.title}" (ID: ${post.id}) has been confirmed. We look forward to seeing you there!`,
+      );
+
+      this.logger.log(`Payment confirmation email sent to ${user.email} for post ${postId}`);
+    } catch (error) {
+      this.logger.error('Error handling paymentIntent.succeeded event', error);
+    }
   }
 
   @Cron(CronExpression.EVERY_6_HOURS)
