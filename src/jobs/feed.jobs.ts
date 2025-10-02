@@ -75,9 +75,13 @@ export class FeedJobsService {
     await this.redisSubscriber.subscribe('paymentIntent.succeeded', async (message) => {
       await this.handlePaymentIntentSucceededEvent(message);
     });
+    await this.redisSubscriber.subscribe('user.finalizeSignUp', async (message) => {
+      await this.handleUserFinalizeSignUpEvent(message);
+    });
     this.logger.log('Subscribed to Redis channel: post.created');
     this.logger.log('Subscribed to Redis channel: post.boosted');
     this.logger.log('Subscribed to Redis channel: paymentIntent.succeeded');
+    this.logger.log('Subscribed to Redis channel: user.finalizeSignUp');
   }
 
   private async handlePostCreatedEvent(message: string) {
@@ -178,7 +182,7 @@ export class FeedJobsService {
       );
 
       const { rows: userRows } = await this.pgPool.query(
-        'SELECT id, email, name FROM user_info WHERE id = $1',
+        'SELECT id, email, first_name FROM user_info WHERE id = $1',
         [userId],
       );
 
@@ -199,8 +203,6 @@ export class FeedJobsService {
           <p>Hi ${user.name || 'there'},</p>
           <p>Your payment was successful and your ticket for the following event has been confirmed:</p>
           <h2>${post.title}</h2>
-          <p><strong>Event ID:</strong> ${post.id}</p>
-          <p>We look forward to seeing you there!</p>
           <p>Best regards,<br>The Togeda Team</p>
         `,
         `Your ticket for "${post.title}" (ID: ${post.id}) has been confirmed. We look forward to seeing you there!`,
@@ -209,6 +211,63 @@ export class FeedJobsService {
       this.logger.log(`Payment confirmation email sent to ${user.email} for post ${postId}`);
     } catch (error) {
       this.logger.error('Error handling paymentIntent.succeeded event', error);
+    }
+  }
+
+  private async handleUserFinalizeSignUpEvent(message: string) {
+    this.logger.log(`Received user.finalizeSignUp event: ${message}`);
+    let parsed: any;
+    try {
+      parsed =
+        typeof message === 'string' ? JSON.parse(JSON.parse(message)) : message;
+    } catch (e) {
+      this.logger.error('Failed to parse user.finalizeSignUp event message', e);
+      return;
+    }
+
+    const userId = parsed?.userId;
+
+    if (!userId) {
+      this.logger.error('user.finalizeSignUp event missing userId');
+      return;
+    }
+
+    try {
+      // Fetch user information
+      const { rows: userRows } = await this.pgPool.query(
+        'SELECT id, email, first_name FROM user_info WHERE id = $1',
+        [userId],
+      );
+
+      if (!userRows.length) {
+        this.logger.warn(`User not found for finalize sign up event. UserId: ${userId}`);
+        return;
+      }
+
+      const user = userRows[0];
+
+      // Send welcome email
+      await this.sesService.sendHtmlEmail(
+        user.email,
+        'Welcome to Togeda!',
+        `
+          <h1>Welcome to Togeda, ${user.first_name || 'there'}!</h1>
+          <p>Thank you for completing your registration. We're excited to have you join our community!</p>
+          <p>With Togeda, you can:</p>
+          <ul>
+            <li>Discover exciting events near you</li>
+            <li>Connect with like-minded people</li>
+            <li>Create and share your own experiences</li>
+          </ul>
+          <p>Get started by exploring events in your area and joining ones that interest you!</p>
+          <p>Best regards,<br>The Togeda Team</p>
+        `,
+        `Welcome to Togeda, ${user.first_name || 'there'}! Thank you for completing your registration. We're excited to have you join our community!`,
+      );
+
+      this.logger.log(`Welcome email sent to ${user.email} for user ${userId}`);
+    } catch (error) {
+      this.logger.error('Error handling user.finalizeSignUp event', error);
     }
   }
 
