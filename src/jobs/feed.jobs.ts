@@ -146,8 +146,28 @@ export class FeedJobsService {
         return;
       }
       this.logger.log(`Stored post.boosted event for post ${postId}`);
-      // todo get email to send to from the post owner
-      this.sesService.sendTextEmail("dm.kaloyan@gmail.com", "Post wast boosted", `The boosted post id: ${postId}`)
+
+      // Fetch post owner's email and send notification
+      const { rows: postOwnerRows } = await this.pgPool.query(
+        'SELECT ui.email, ui.first_name, p.title FROM post p JOIN user_info ui ON p.user_id = ui.id WHERE p.id = $1',
+        [postId],
+      );
+
+      if (postOwnerRows.length > 0) {
+        const owner = postOwnerRows[0];
+        await this.sesService.sendHtmlEmail(
+          owner.email,
+          'Your Event Has Been Boosted!',
+          `
+            <h1>Great News, ${owner.first_name || 'there'}!</h1>
+            <p>Your event "${owner.title}" has been successfully boosted and will now reach more people!</p>
+            <p>Your event will have increased visibility for the next 24 hours.</p>
+            <p>Best regards,<br>The Togeda Team</p>
+          `,
+          `Great news! Your event "${owner.title}" has been boosted and will reach more people for the next 24 hours.`,
+        );
+        this.logger.log(`Boost notification email sent to ${owner.email} for post ${postId}`);
+      }
     } catch (err) {
       this.logger.error('Failed saving post.boosted event to Redis', err);
       return;
