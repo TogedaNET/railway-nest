@@ -40,6 +40,9 @@ export class SesService {
    * @returns Promise with the MessageId if successful
    */
   async sendEmail(options: EmailOptions): Promise<string | null> {
+    if(process.env.ENVIRONMENT_NAME != 'PROD') {
+        return null;
+    }
     try {
       const toAddresses = Array.isArray(options.to)
         ? options.to
