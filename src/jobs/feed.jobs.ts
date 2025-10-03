@@ -72,8 +72,16 @@ export class FeedJobsService {
     await this.redisSubscriber.subscribe('post.boosted', async (message) => {
       await this.handlePostBoostedEvent(message);
     });
+    await this.redisSubscriber.subscribe('paymentIntent.succeeded', async (message) => {
+      await this.handlePaymentIntentSucceededEvent(message);
+    });
+    await this.redisSubscriber.subscribe('user.finalizeSignUp', async (message) => {
+      await this.handleUserFinalizeSignUpEvent(message);
+    });
     this.logger.log('Subscribed to Redis channel: post.created');
     this.logger.log('Subscribed to Redis channel: post.boosted');
+    this.logger.log('Subscribed to Redis channel: paymentIntent.succeeded');
+    this.logger.log('Subscribed to Redis channel: user.finalizeSignUp');
   }
 
   private async handlePostCreatedEvent(message: string) {
@@ -138,13 +146,149 @@ export class FeedJobsService {
         return;
       }
       this.logger.log(`Stored post.boosted event for post ${postId}`);
-      // todo get email to send to from the post owner
-      this.sesService.sendTextEmail("dm.kaloyan@gmail.com", "Post wast boosted", `The boosted post id: ${postId}`)
+
+      // Fetch post owner's email and send notification
+      const { rows: postOwnerRows } = await this.pgPool.query(
+        'SELECT ui.email, ui.first_name, p.title FROM post p JOIN user_info ui ON p.user_id = ui.id WHERE p.id = $1',
+        [postId],
+      );
+
+      if (postOwnerRows.length > 0) {
+        const owner = postOwnerRows[0];
+        await this.sesService.sendHtmlEmail(
+          owner.email,
+          'Your Event Has Been Boosted!',
+          `
+            <h1>Great News, ${owner.first_name || 'there'}!</h1>
+            <p>Your event "${owner.title}" has been successfully boosted and will now reach more people!</p>
+            <p>Your event will have increased visibility for the next 24 hours.</p>
+            <p>Best regards,<br>The Togeda Team</p>
+          `,
+          `Great news! Your event "${owner.title}" has been boosted and will reach more people for the next 24 hours.`,
+        );
+        this.logger.log(`Boost notification email sent to ${owner.email} for post ${postId}`);
+      }
     } catch (err) {
       this.logger.error('Failed saving post.boosted event to Redis', err);
       return;
     }
     await this.prePopulateUserFeedsInRange(eventToStore.postId);
+  }
+
+  private async handlePaymentIntentSucceededEvent(message: string) {
+    this.logger.log(`Received paymentIntent.succeeded event: ${message}`);
+    let parsed: any;
+    try {
+      parsed =
+        typeof message === 'string' ? JSON.parse(JSON.parse(message)) : message;
+    } catch (e) {
+      this.logger.error('Failed to parse paymentIntent.succeeded event message', e);
+      return;
+    }
+
+    const postId = parsed?.postId;
+    const userId = parsed?.userId;
+
+    if (!postId || !userId) {
+      this.logger.error('paymentIntent.succeeded event missing postId or userId');
+      return;
+    }
+
+    try {
+      // Fetch post and user information
+      const { rows: postRows } = await this.pgPool.query(
+        'SELECT id, title FROM post WHERE id = $1',
+        [postId],
+      );
+
+      const { rows: userRows } = await this.pgPool.query(
+        'SELECT id, email, first_name FROM user_info WHERE id = $1',
+        [userId],
+      );
+
+      if (!postRows.length || !userRows.length) {
+        this.logger.warn(`Post or user not found for payment intent event. PostId: ${postId}, UserId: ${userId}`);
+        return;
+      }
+
+      const post = postRows[0];
+      const user = userRows[0];
+
+      // Send email notification
+      await this.sesService.sendHtmlEmail(
+        user.email,
+        `Ticket Confirmed - ${post.title}`,
+        `
+          <h1>Your Ticket is Confirmed!</h1>
+          <p>Hi ${user.name || 'there'},</p>
+          <p>Your payment was successful and your ticket for the following event has been confirmed:</p>
+          <h2>${post.title}</h2>
+          <p>Best regards,<br>The Togeda Team</p>
+        `,
+        `Your ticket for "${post.title}" (ID: ${post.id}) has been confirmed. We look forward to seeing you there!`,
+      );
+
+      this.logger.log(`Payment confirmation email sent to ${user.email} for post ${postId}`);
+    } catch (error) {
+      this.logger.error('Error handling paymentIntent.succeeded event', error);
+    }
+  }
+
+  private async handleUserFinalizeSignUpEvent(message: string) {
+    this.logger.log(`Received user.finalizeSignUp event: ${message}`);
+    let parsed: any;
+    try {
+      parsed =
+        typeof message === 'string' ? JSON.parse(JSON.parse(message)) : message;
+    } catch (e) {
+      this.logger.error('Failed to parse user.finalizeSignUp event message', e);
+      return;
+    }
+
+    const userId = parsed?.userId;
+
+    if (!userId) {
+      this.logger.error('user.finalizeSignUp event missing userId');
+      return;
+    }
+
+    try {
+      // Fetch user information
+      const { rows: userRows } = await this.pgPool.query(
+        'SELECT id, email, first_name FROM user_info WHERE id = $1',
+        [userId],
+      );
+
+      if (!userRows.length) {
+        this.logger.warn(`User not found for finalize sign up event. UserId: ${userId}`);
+        return;
+      }
+
+      const user = userRows[0];
+
+      // Send welcome email
+      await this.sesService.sendHtmlEmail(
+        user.email,
+        'Welcome to Togeda!',
+        `
+          <h1>Welcome to Togeda, ${user.first_name || 'there'}!</h1>
+          <p>Thank you for completing your registration. We're excited to have you join our community!</p>
+          <p>With Togeda, you can:</p>
+          <ul>
+            <li>Discover exciting events near you</li>
+            <li>Connect with like-minded people</li>
+            <li>Create and share your own experiences</li>
+          </ul>
+          <p>Get started by exploring events in your area and joining ones that interest you!</p>
+          <p>Best regards,<br>The Togeda Team</p>
+        `,
+        `Welcome to Togeda, ${user.first_name || 'there'}! Thank you for completing your registration. We're excited to have you join our community!`,
+      );
+
+      this.logger.log(`Welcome email sent to ${user.email} for user ${userId}`);
+    } catch (error) {
+      this.logger.error('Error handling user.finalizeSignUp event', error);
+    }
   }
 
   @Cron(CronExpression.EVERY_6_HOURS)
