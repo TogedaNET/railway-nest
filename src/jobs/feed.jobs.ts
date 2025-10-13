@@ -8,7 +8,7 @@ import { firstValueFrom } from 'rxjs';
 import { v4 as uuidv4 } from 'uuid';
 import * as dayjs from 'dayjs';
 import { RedisClientType } from 'redis';
-import { SesService } from 'src/ses/ses.service';
+import { SesService } from '../ses/ses.service';
 
 // Type for Mixpanel Engage API response
 interface MixpanelEngageUser {
@@ -78,10 +78,14 @@ export class FeedJobsService {
     await this.redisSubscriber.subscribe('user.finalizeSignUp', async (message) => {
       await this.handleUserFinalizeSignUpEvent(message);
     });
+    await this.redisSubscriber.subscribe('user.updateFeed', async (message) => {
+      await this.handleUpdateUserFeed(message);
+    });
     this.logger.log('Subscribed to Redis channel: post.created');
     this.logger.log('Subscribed to Redis channel: post.boosted');
     this.logger.log('Subscribed to Redis channel: paymentIntent.succeeded');
     this.logger.log('Subscribed to Redis channel: user.finalizeSignUp');
+    this.logger.log('Subscribed to Redis channel: user.updateFeed');
   }
 
   private async handlePostCreatedEvent(message: string) {
@@ -288,6 +292,32 @@ export class FeedJobsService {
       this.logger.log(`Welcome email sent to ${user.email} for user ${userId}`);
     } catch (error) {
       this.logger.error('Error handling user.finalizeSignUp event', error);
+    }
+  }
+
+  private async handleUpdateUserFeed(message: string) {
+    this.logger.log(`Received user.updateFeed event: ${message}`);
+    let parsed: any;
+    try {
+      parsed =
+        typeof message === 'string' ? JSON.parse(JSON.parse(message)) : message;
+    } catch (e) {
+      this.logger.error('Failed to parse user.updateFeed event message', e);
+      return;
+    }
+
+    const userId = parsed?.userId;
+
+    if (!userId) {
+      this.logger.error('user.updateFeed event missing userId');
+      return;
+    }
+
+    try {
+      await this.cachePersonalizedFeedForAllUsers([userId]);
+      this.logger.log(`Feed updated for user ${userId}`);
+    } catch (error) {
+      this.logger.error('Error handling user.updateFeed event', error);
     }
   }
 
@@ -556,7 +586,7 @@ export class FeedJobsService {
 
       // Fetch user locations
       const { rows: users } = await this.pgPool.query(
-        'SELECT id, COALESCE(ST_Y(user_last_known_location::geometry), latitude) as latitude, COALESCE(ST_Y(user_last_known_location::geometry), longitude) as longitude, FROM user_info WHERE id = ANY($1)',
+        'SELECT id, COALESCE(ST_Y(user_last_known_location::geometry), latitude) as latitude, COALESCE(ST_Y(user_last_known_location::geometry), longitude) as longitude FROM user_info WHERE id = ANY($1)',
         [userIds],
       );
 
