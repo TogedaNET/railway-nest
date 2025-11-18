@@ -1,6 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { AppModule } from '../src/app.module';
 import { FeedJobsService } from '../src/jobs/feed.jobs';
+import { UserDeleteEventHandler } from '../src/jobs/event-handlers';
 
 describe('FeedJobsService Cron', () => {
   let service: FeedJobsService;

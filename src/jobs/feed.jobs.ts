@@ -9,6 +9,14 @@ import { v4 as uuidv4 } from 'uuid';
 import * as dayjs from 'dayjs';
 import { RedisClientType } from 'redis';
 import { SesService } from '../ses/ses.service';
+import {
+  PostCreatedEventHandler,
+  PostBoostedEventHandler,
+  PaymentIntentSucceededEventHandler,
+  UserFinalizeSignUpEventHandler,
+  UserUpdateFeedEventHandler,
+  UserDeleteEventHandler,
+} from './event-handlers';
 
 // Type for Mixpanel Engage API response
 interface MixpanelEngageUser {
@@ -42,6 +50,14 @@ export class FeedJobsService {
   private isRunning2 = false;
   private redisSubscriber: RedisClientType<any, any>;
 
+  // Event handlers
+  private postCreatedHandler: PostCreatedEventHandler;
+  private postBoostedHandler: PostBoostedEventHandler;
+  private paymentIntentSucceededHandler: PaymentIntentSucceededEventHandler;
+  private userFinalizeSignUpHandler: UserFinalizeSignUpEventHandler;
+  private userUpdateFeedHandler: UserUpdateFeedEventHandler;
+  private userDeleteHandler: UserDeleteEventHandler;
+
   constructor(
     private readonly httpService: HttpService,
     @Inject('REDIS_CLIENT')
@@ -56,6 +72,15 @@ export class FeedJobsService {
       database: process.env.POSTGRESDB,
       ssl: true,
     });
+
+    // Initialize event handlers
+    this.postCreatedHandler = new PostCreatedEventHandler(this);
+    this.postBoostedHandler = new PostBoostedEventHandler(this.pgPool, this.redisClient, this.sesService, this);
+    this.paymentIntentSucceededHandler = new PaymentIntentSucceededEventHandler(this.pgPool, this.sesService);
+    this.userFinalizeSignUpHandler = new UserFinalizeSignUpEventHandler(this.pgPool, this.sesService);
+    this.userUpdateFeedHandler = new UserUpdateFeedEventHandler(this);
+    this.userDeleteHandler = new UserDeleteEventHandler(this.pgPool, this.redisClient);
+
     this.initRedisSubscriber();
   }
 
@@ -66,259 +91,21 @@ export class FeedJobsService {
       this.logger.error('Redis Subscriber Error for pub/sub', err),
     );
     await this.redisSubscriber.connect();
-    await this.redisSubscriber.subscribe('post.created', async (message) => {
-      await this.handlePostCreatedEvent(message);
-    });
-    await this.redisSubscriber.subscribe('post.boosted', async (message) => {
-      await this.handlePostBoostedEvent(message);
-    });
-    await this.redisSubscriber.subscribe('paymentIntent.succeeded', async (message) => {
-      await this.handlePaymentIntentSucceededEvent(message);
-    });
-    await this.redisSubscriber.subscribe('user.finalizeSignUp', async (message) => {
-      await this.handleUserFinalizeSignUpEvent(message);
-    });
-    await this.redisSubscriber.subscribe('user.updateFeed', async (message) => {
-      await this.handleUpdateUserFeed(message);
-    });
+
+    // Subscribe to events using dedicated handlers
+    await this.redisSubscriber.subscribe('post.created', (message) => this.postCreatedHandler.handle(message));
+    await this.redisSubscriber.subscribe('post.boosted', (message) => this.postBoostedHandler.handle(message));
+    await this.redisSubscriber.subscribe('paymentIntent.succeeded', (message) => this.paymentIntentSucceededHandler.handle(message));
+    await this.redisSubscriber.subscribe('user.finalizeSignUp', (message) => this.userFinalizeSignUpHandler.handle(message));
+    await this.redisSubscriber.subscribe('user.updateFeed', (message) => this.userUpdateFeedHandler.handle(message));
+    await this.redisSubscriber.subscribe('user.delete', (message) => this.userDeleteHandler.handle(message));
+
     this.logger.log('Subscribed to Redis channel: post.created');
     this.logger.log('Subscribed to Redis channel: post.boosted');
     this.logger.log('Subscribed to Redis channel: paymentIntent.succeeded');
     this.logger.log('Subscribed to Redis channel: user.finalizeSignUp');
     this.logger.log('Subscribed to Redis channel: user.updateFeed');
-  }
-
-  private async handlePostCreatedEvent(message: string) {
-    this.logger.log(`Received post.created event: ${message}`);
-    let postEvent;
-    try {
-      postEvent =
-        typeof message === 'string' ? JSON.parse(JSON.parse(message)) : message;
-    } catch (e) {
-      this.logger.error('Failed to parse post.created event message', e);
-      return;
-    }
-    if (!postEvent || !postEvent.postId) {
-      this.logger.error('post.created event missing postId');
-      return;
-    }
-    await this.prePopulateUserFeedsInRange(postEvent.postId);
-  }
-
-  private async handlePostBoostedEvent(message: string) {
-    this.logger.log(`Received post.boosted event: ${message}`);
-    let parsed: any;
-    try {
-      parsed =
-        typeof message === 'string' ? JSON.parse(JSON.parse(message)) : message;
-    } catch (e) {
-      this.logger.error('Failed to parse post.boosted event message', e);
-      return;
-    }
-
-    const allowedTypes = new Set(['one_day']);
-    const postId = parsed?.postId;
-    const type = parsed?.type;
-    const timestamp = parsed?.timestamp;
-
-    if (!postId) {
-      this.logger.error('post.boosted event missing postId');
-      return;
-    }
-    if (!allowedTypes.has(type)) {
-      this.logger.error(`post.boosted event has invalid type: ${type}`);
-      return;
-    }
-
-    const eventToStore = {
-      postId: String(postId),
-      type,
-      timestamp: Number(timestamp),
-    };
-
-    try {
-      if (type === 'one_day') {
-        await this.redisClient.set(
-          `post:boosted:${String(postId)}`,
-          JSON.stringify(eventToStore),
-          {
-            EX: ONE_DAY_IN_SECONDS,
-          },
-        );
-      } else {
-        this.logger.error("unknown type of boost event: ", type);
-        return;
-      }
-      this.logger.log(`Stored post.boosted event for post ${postId}`);
-
-      // Fetch post owner's email and send notification
-      const { rows: postOwnerRows } = await this.pgPool.query(
-        'SELECT ui.email, ui.first_name, p.title FROM post p JOIN user_info ui ON p.user_id = ui.id WHERE p.id = $1',
-        [postId],
-      );
-
-      if (postOwnerRows.length > 0) {
-        const owner = postOwnerRows[0];
-        await this.sesService.sendHtmlEmail(
-          owner.email,
-          'Your Event Has Been Boosted!',
-          `
-            <h1>Great News, ${owner.first_name || 'there'}!</h1>
-            <p>Your event "${owner.title}" has been successfully boosted and will now reach more people!</p>
-            <p>Your event will have increased visibility for the next 24 hours.</p>
-            <p>Best regards,<br>The Togeda Team</p>
-          `,
-          `Great news! Your event "${owner.title}" has been boosted and will reach more people for the next 24 hours.`,
-        );
-        this.logger.log(`Boost notification email sent to ${owner.email} for post ${postId}`);
-      }
-    } catch (err) {
-      this.logger.error('Failed saving post.boosted event to Redis', err);
-      return;
-    }
-    await this.prePopulateUserFeedsInRange(eventToStore.postId);
-  }
-
-  private async handlePaymentIntentSucceededEvent(message: string) {
-    this.logger.log(`Received paymentIntent.succeeded event: ${message}`);
-    let parsed: any;
-    try {
-      parsed =
-        typeof message === 'string' ? JSON.parse(JSON.parse(message)) : message;
-    } catch (e) {
-      this.logger.error('Failed to parse paymentIntent.succeeded event message', e);
-      return;
-    }
-
-    const postId = parsed?.postId;
-    const userId = parsed?.userId;
-
-    if (!postId || !userId) {
-      this.logger.error('paymentIntent.succeeded event missing postId or userId');
-      return;
-    }
-
-    try {
-      // Fetch post and user information
-      const { rows: postRows } = await this.pgPool.query(
-        'SELECT id, title FROM post WHERE id = $1',
-        [postId],
-      );
-
-      const { rows: userRows } = await this.pgPool.query(
-        'SELECT id, email, first_name FROM user_info WHERE id = $1',
-        [userId],
-      );
-
-      if (!postRows.length || !userRows.length) {
-        this.logger.warn(`Post or user not found for payment intent event. PostId: ${postId}, UserId: ${userId}`);
-        return;
-      }
-
-      const post = postRows[0];
-      const user = userRows[0];
-
-      // Send email notification
-      await this.sesService.sendHtmlEmail(
-        user.email,
-        `Ticket Confirmed - ${post.title}`,
-        `
-          <h1>Your Ticket is Confirmed!</h1>
-          <p>Hi ${user.name || 'there'},</p>
-          <p>Your payment was successful and your ticket for the following event has been confirmed:</p>
-          <h2>${post.title}</h2>
-          <p>Best regards,<br>The Togeda Team</p>
-        `,
-        `Your ticket for "${post.title}" (ID: ${post.id}) has been confirmed. We look forward to seeing you there!`,
-      );
-
-      this.logger.log(`Payment confirmation email sent to ${user.email} for post ${postId}`);
-    } catch (error) {
-      this.logger.error('Error handling paymentIntent.succeeded event', error);
-    }
-  }
-
-  private async handleUserFinalizeSignUpEvent(message: string) {
-    this.logger.log(`Received user.finalizeSignUp event: ${message}`);
-    let parsed: any;
-    try {
-      parsed =
-        typeof message === 'string' ? JSON.parse(JSON.parse(message)) : message;
-    } catch (e) {
-      this.logger.error('Failed to parse user.finalizeSignUp event message', e);
-      return;
-    }
-
-    const userId = parsed?.userId;
-
-    if (!userId) {
-      this.logger.error('user.finalizeSignUp event missing userId');
-      return;
-    }
-
-    try {
-      // Fetch user information
-      const { rows: userRows } = await this.pgPool.query(
-        'SELECT id, email, first_name FROM user_info WHERE id = $1',
-        [userId],
-      );
-
-      if (!userRows.length) {
-        this.logger.warn(`User not found for finalize sign up event. UserId: ${userId}`);
-        return;
-      }
-
-      const user = userRows[0];
-
-      // Send welcome email
-      await this.sesService.sendHtmlEmail(
-        user.email,
-        'Welcome to Togeda!',
-        `
-          <h1>Welcome to Togeda, ${user.first_name || 'there'}!</h1>
-          <p>Thank you for completing your registration. We're excited to have you join our community!</p>
-          <p>With Togeda, you can:</p>
-          <ul>
-            <li>Discover exciting events near you</li>
-            <li>Connect with like-minded people</li>
-            <li>Create and share your own experiences</li>
-          </ul>
-          <p>Get started by exploring events in your area and joining ones that interest you!</p>
-          <p>Best regards,<br>The Togeda Team</p>
-        `,
-        `Welcome to Togeda, ${user.first_name || 'there'}! Thank you for completing your registration. We're excited to have you join our community!`,
-      );
-
-      this.logger.log(`Welcome email sent to ${user.email} for user ${userId}`);
-    } catch (error) {
-      this.logger.error('Error handling user.finalizeSignUp event', error);
-    }
-  }
-
-  private async handleUpdateUserFeed(message: string) {
-    this.logger.log(`Received user.updateFeed event: ${message}`);
-    let parsed: any;
-    try {
-      parsed =
-        typeof message === 'string' ? JSON.parse(JSON.parse(message)) : message;
-    } catch (e) {
-      this.logger.error('Failed to parse user.updateFeed event message', e);
-      return;
-    }
-
-    const userId = parsed?.userId;
-
-    if (!userId) {
-      this.logger.error('user.updateFeed event missing userId');
-      return;
-    }
-
-    try {
-      await this.cachePersonalizedFeedForAllUsers([userId]);
-      this.logger.log(`Feed updated for user ${userId}`);
-    } catch (error) {
-      this.logger.error('Error handling user.updateFeed event', error);
-    }
+    this.logger.log('Subscribed to Redis channel: user.delete');
   }
 
   @Cron(CronExpression.EVERY_6_HOURS)
