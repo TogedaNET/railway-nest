@@ -4,7 +4,7 @@ describe('FeedJobsService', () => {
   let service: FeedJobsService;
 
   beforeEach(() => {
-    service = new FeedJobsService(null, null);
+    service = new FeedJobsService(null, null, null);
   });
 
   describe('jaccard', () => {
