@@ -16,6 +16,7 @@ import {
   UserFinalizeSignUpEventHandler,
   UserUpdateFeedEventHandler,
   UserDeleteEventHandler,
+  UserBatchDeleteEventHandler,
 } from './event-handlers';
 
 // Type for Mixpanel Engage API response
@@ -57,6 +58,7 @@ export class FeedJobsService {
   private userFinalizeSignUpHandler: UserFinalizeSignUpEventHandler;
   private userUpdateFeedHandler: UserUpdateFeedEventHandler;
   private userDeleteHandler: UserDeleteEventHandler;
+  private userBatchDeleteHandler: UserBatchDeleteEventHandler;
 
   constructor(
     private readonly httpService: HttpService,
@@ -99,6 +101,7 @@ export class FeedJobsService {
     await this.redisSubscriber.subscribe('user.finalizeSignUp', (message) => this.userFinalizeSignUpHandler.handle(message));
     await this.redisSubscriber.subscribe('user.updateFeed', (message) => this.userUpdateFeedHandler.handle(message));
     await this.redisSubscriber.subscribe('user.delete', (message) => this.userDeleteHandler.handle(message));
+    await this.redisSubscriber.subscribe('user.batchDelete', (message) => this.userBatchDeleteHandler.handle(message));
 
     this.logger.log('Subscribed to Redis channel: post.created');
     this.logger.log('Subscribed to Redis channel: post.boosted');
@@ -106,6 +109,7 @@ export class FeedJobsService {
     this.logger.log('Subscribed to Redis channel: user.finalizeSignUp');
     this.logger.log('Subscribed to Redis channel: user.updateFeed');
     this.logger.log('Subscribed to Redis channel: user.delete');
+    this.logger.log('Subscribed to Redis channel: user.batchDelete');
   }
 
   @Cron(CronExpression.EVERY_6_HOURS)
