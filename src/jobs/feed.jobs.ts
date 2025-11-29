@@ -82,6 +82,7 @@ export class FeedJobsService {
     this.userFinalizeSignUpHandler = new UserFinalizeSignUpEventHandler(this.pgPool, this.sesService);
     this.userUpdateFeedHandler = new UserUpdateFeedEventHandler(this);
     this.userDeleteHandler = new UserDeleteEventHandler(this.pgPool, this.redisClient);
+    this.userBatchDeleteHandler = new UserBatchDeleteEventHandler(this.pgPool, this.redisClient);
 
     this.initRedisSubscriber();
   }
@@ -101,6 +102,7 @@ export class FeedJobsService {
     await this.redisSubscriber.subscribe('user.finalizeSignUp', (message) => this.userFinalizeSignUpHandler.handle(message));
     await this.redisSubscriber.subscribe('user.updateFeed', (message) => this.userUpdateFeedHandler.handle(message));
     await this.redisSubscriber.subscribe('user.delete', (message) => this.userDeleteHandler.handle(message));
+    // TODO remove this subscbriber, not needed
     await this.redisSubscriber.subscribe('user.batchDelete', (message) => this.userBatchDeleteHandler.handle(message));
 
     this.logger.log('Subscribed to Redis channel: post.created');
