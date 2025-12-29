@@ -237,6 +237,8 @@ export class UserDeleteEventHandler extends BaseRedisEventHandler {
             await client.query('DELETE FROM user_profile_photos WHERE user_id = $1', [
                 userId,
             ]);
+            await client.query('DELETE FROM club_join_requests WHERE join_requests = $1', [userId]);
+            await client.query('DELETE FROM post_join_requests WHERE join_requests = $1', [userId]);
             await client.query('INSERT INTO user_profile_photos (user_id, profile_photos) VALUES ($1, $2)', [
                 userId,
                 'https://togeda-profile-photos.s3.eu-central-1.amazonaws.com/istockphoto-1495088043-612x612.jpg', // or some placeholder value
