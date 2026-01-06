@@ -194,7 +194,6 @@ export class UserBatchDeleteEventHandler extends BaseRedisEventHandler {
          WHERE id = $1`,
                     [userId],
                 );
-                this.logger.log(`Anonymized user data for user ${userId}`);
 
                 // 6. Clear relationships
                 await client.query(
@@ -209,7 +208,6 @@ export class UserBatchDeleteEventHandler extends BaseRedisEventHandler {
                     'DELETE FROM block_users WHERE block_user_id = $1 OR target_user_id = $1',
                     [userId],
                 );
-                this.logger.log(`Cleared relationships for user ${userId}`);
 
                 // 7. Clear collections
                 await client.query('DELETE FROM user_saved_posts WHERE user_id = $1', [
@@ -240,11 +238,9 @@ export class UserBatchDeleteEventHandler extends BaseRedisEventHandler {
                     userId,
                     'https://togeda-profile-photos.s3.eu-central-1.amazonaws.com/istockphoto-1495088043-612x612.jpg', // or some placeholder value
                 ]);
-                this.logger.log(`Cleared collections for user ${userId}`);
 
                 // 8. Delete activities
                 await client.query('DELETE FROM activity WHERE user_id = $1', [userId]);
-                this.logger.log(`Deleted activities for user ${userId}`);
 
                 await client.query('COMMIT');
                 this.logger.log(
