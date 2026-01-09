@@ -60,7 +60,7 @@ export class UserFinalizeSignUpEventHandler extends BaseRedisEventHandler {
                 `Welcome to Togeda, ${user.first_name || 'there'}! Thank you for completing your registration. We're excited to have you join our community!`,
             );
 
-            this.logger.log(`Welcome email sent to ${user.email} for user ${userId}`);
+            this.logger.log(`Welcome email sent for user ${userId}`);
         } catch (error) {
             this.logger.error('Error handling user.finalizeSignUp event', error);
         }
