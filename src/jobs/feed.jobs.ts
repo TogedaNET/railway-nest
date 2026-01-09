@@ -81,7 +81,7 @@ export class FeedJobsService {
     this.paymentIntentSucceededHandler = new PaymentIntentSucceededEventHandler(this.pgPool, this.sesService);
     this.userFinalizeSignUpHandler = new UserFinalizeSignUpEventHandler(this.pgPool, this.sesService);
     this.userUpdateFeedHandler = new UserUpdateFeedEventHandler(this);
-    this.userDeleteHandler = new UserDeleteEventHandler(this.pgPool, this.redisClient);
+    this.userDeleteHandler = new UserDeleteEventHandler(this.pgPool, this.redisClient, this.sesService);
     this.userBatchDeleteHandler = new UserBatchDeleteEventHandler(this.pgPool, this.redisClient);
 
     this.initRedisSubscriber();
