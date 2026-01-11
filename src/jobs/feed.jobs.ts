@@ -126,7 +126,7 @@ export class FeedJobsService {
     try {
       this.logger.log('updateTrendingPosts called');
 
-      // 1. Fetch all posts with status 'NOT_STARTED', creation date, user_id, user_role, and participant count
+      // 1. Fetch all posts with status 'NOT_STARTED' or 'HAS_STARTED', creation date, user_id, user_role, and participant count
       const { rows: posts } = await this.pgPool.query(
         `SELECT p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, 
                 COUNT(pp.id) AS participant_count,
@@ -135,7 +135,7 @@ export class FeedJobsService {
          FROM post p
          JOIN user_info ui ON p.user_id = ui.id
          LEFT JOIN post_participant pp ON p.id = pp.post_id
-         WHERE p.status = 'NOT_STARTED'
+         WHERE p.status IN ('NOT_STARTED', 'HAS_STARTED')
          GROUP BY p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role`,
       );
 
@@ -512,7 +512,7 @@ export class FeedJobsService {
       FROM post p
       JOIN user_info ui ON p.user_id = ui.id
       LEFT JOIN post_participant pp ON p.id = pp.post_id
-      WHERE p.status = 'NOT_STARTED'
+      WHERE p.status IN ('NOT_STARTED', 'HAS_STARTED')
       GROUP BY p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, p.club_id, p.user_current_location
     `);
 
