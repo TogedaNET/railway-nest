@@ -1,6 +1,7 @@
 import { Pool, PoolClient } from 'pg';
 import { RedisClientType } from 'redis';
 import { BaseRedisEventHandler } from './base-event-handler';
+import { SesService } from '../../ses/ses.service';
 
 /**
  * Handles user.delete Redis pub/sub events
@@ -12,6 +13,7 @@ export class UserDeleteEventHandler extends BaseRedisEventHandler {
     constructor(
         private readonly pgPool: Pool,
         private readonly redisClient: RedisClientType<any, any>,
+        private readonly sesService: SesService,
     ) {
         super('UserDeleteEventHandler');
     }
@@ -33,6 +35,13 @@ export class UserDeleteEventHandler extends BaseRedisEventHandler {
         const client = await this.pgPool.connect();
         try {
             await client.query('BEGIN');
+
+            // 0. Get user email before anonymization
+            const { rows: userEmailRows } = await client.query(
+                'SELECT email FROM user_info WHERE id = $1',
+                [userId],
+            );
+            const userEmail = userEmailRows.length ? userEmailRows[0].email : 'unknown';
             // 1. Delete all user posts
             const { rows: userPosts } = await client.query(
                 'SELECT id FROM post WHERE user_id = $1',
@@ -254,6 +263,26 @@ export class UserDeleteEventHandler extends BaseRedisEventHandler {
             this.logger.log(
                 `User deletion cleanup completed successfully for user ${userId} at timestamp ${timestamp}`,
             );
+
+            // 9. Send email for feedback
+            try {
+                await this.sesService.sendHtmlEmail(
+                    userEmail,
+                    'Feedback Request From Togeda',
+                    `
+          <h2>We're Sorry to See You Go</h2>
+          <p>Your account has been successfully deleted from Togeda.</p>
+          <p>We'd love to hear your feedback to help us improve. Could you take a moment to let us know why you decided to leave?</p>
+          <p>Your insights are valuable to us and will help make Togeda better for everyone.</p>
+          <p>Thank you for being part of our community.</p>
+        `,
+                );
+                this.logger.log(`Feedback request sent to ${userEmail} for user ${userId}`);
+            } catch (emailError) {
+                this.logger.error(`Failed to send deletion notification email for user ${userId}:`, emailError);
+                // Don't throw - email failure shouldn't fail the entire deletion process
+            }
+
         } catch (error) {
             await client.query('ROLLBACK');
             this.logger.error(`Error handling user.delete event for user ${userId}:`, error);
