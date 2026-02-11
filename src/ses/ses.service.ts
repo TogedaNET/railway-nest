@@ -73,10 +73,12 @@ export class SesService {
             }),
           },
         },
-        ...(options.replyTo && {
-          ReplyToAddresses: [options.replyTo],
-        }),
       };
+
+      // Add ReplyToAddresses only if explicitly provided, otherwise replies go to Source address
+      if (options.replyTo) {
+        params.ReplyToAddresses = [options.from || this.defaultFromEmail];
+      }
 
       const command = new SendEmailCommand(params);
       const response = await this.sesClient.send(command);
