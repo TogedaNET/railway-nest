@@ -17,6 +17,7 @@ import {
   UserUpdateFeedEventHandler,
   UserDeleteEventHandler,
   UserBatchDeleteEventHandler,
+  ClubCreatedEventHandler,
 } from './event-handlers';
 
 // Type for Mixpanel Engage API response
@@ -49,6 +50,7 @@ export class FeedJobsService {
   private readonly pgPool: Pool;
   private isRunning = false;
   private isRunning2 = false;
+  private isRunning3 = false;
   private redisSubscriber: RedisClientType<any, any>;
 
   // Event handlers
@@ -59,6 +61,7 @@ export class FeedJobsService {
   private userUpdateFeedHandler: UserUpdateFeedEventHandler;
   private userDeleteHandler: UserDeleteEventHandler;
   private userBatchDeleteHandler: UserBatchDeleteEventHandler;
+  private clubCreatedHandler: ClubCreatedEventHandler;
 
   constructor(
     private readonly httpService: HttpService,
@@ -83,6 +86,7 @@ export class FeedJobsService {
     this.userUpdateFeedHandler = new UserUpdateFeedEventHandler(this);
     this.userDeleteHandler = new UserDeleteEventHandler(this.pgPool, this.redisClient, this.sesService);
     this.userBatchDeleteHandler = new UserBatchDeleteEventHandler(this.pgPool, this.redisClient);
+    this.clubCreatedHandler = new ClubCreatedEventHandler(this);
 
     this.initRedisSubscriber();
   }
@@ -104,6 +108,7 @@ export class FeedJobsService {
     await this.redisSubscriber.subscribe('user.delete', (message) => this.userDeleteHandler.handle(message));
     // TODO remove this subscbriber, not needed
     await this.redisSubscriber.subscribe('user.batchDelete', (message) => this.userBatchDeleteHandler.handle(message));
+    await this.redisSubscriber.subscribe('club.created', (message) => this.clubCreatedHandler.handle(message));
 
     this.logger.log('Subscribed to Redis channel: post.created');
     this.logger.log('Subscribed to Redis channel: post.boosted');
@@ -112,6 +117,7 @@ export class FeedJobsService {
     this.logger.log('Subscribed to Redis channel: user.updateFeed');
     this.logger.log('Subscribed to Redis channel: user.delete');
     this.logger.log('Subscribed to Redis channel: user.batchDelete');
+    this.logger.log('Subscribed to Redis channel: club.created');
   }
 
   @Cron(CronExpression.EVERY_6_HOURS)
@@ -351,6 +357,28 @@ export class FeedJobsService {
       this.logger.error('Error in prePopulateAllActiveUsersFeeds', error);
     } finally {
       this.isRunning2 = false;
+    }
+  }
+
+  @Cron(CronExpression.EVERY_DAY_AT_2AM)
+  async prePopulateAllActiveUsersClubFeeds() {
+    if (this.isRunning3) {
+      this.logger.warn(
+        'prePopulateAllActiveUsersClubFeeds skipped: previous run still in progress',
+      );
+      return;
+    }
+    this.isRunning3 = true;
+    this.logger.log('prePopulateAllActiveUsersClubFeeds called');
+    try {
+      const userIds = await this.fetchAllMixpanelCohortUsers();
+      this.logger.log(`Active user IDs: ${userIds.length}`);
+      await this.cachePersonalizedClubFeedForAllUsers(userIds);
+      this.logger.log(`prePopulateAllActiveUsersClubFeeds finished`);
+    } catch (error) {
+      this.logger.error('Error in prePopulateAllActiveUsersClubFeeds', error);
+    } finally {
+      this.isRunning3 = false;
     }
   }
 
@@ -671,6 +699,173 @@ export class FeedJobsService {
     const pipeline = this.redisClient.multi();
     for (const op of redisOps) {
       pipeline.set(op.key, JSON.stringify(op.value), { EX: 60 * 60 * 24 * 3 }); // 3 days ttl
+    }
+    await pipeline.exec();
+  }
+
+  async prePopulateClubFeedsInRange(clubId: string) {
+    this.logger.log('prePopulateClubFeedsInRange called');
+    try {
+      const { rows: clubRows } = await this.pgPool.query(
+        'SELECT latitude, longitude FROM club WHERE id = $1',
+        [clubId],
+      );
+      if (!clubRows.length) {
+        this.logger.warn(`Club not found for id: ${clubId}`);
+        return;
+      }
+      const clubLat = clubRows[0].latitude;
+      const clubLon = clubRows[0].longitude;
+      if (clubLat == null || clubLon == null) {
+        this.logger.error(`Club ${clubId} missing coordinates`);
+        return;
+      }
+
+      const userIds = await this.fetchAllMixpanelCohortUsers();
+      this.logger.log(`Users active: ${userIds.length}`);
+
+      const { rows: users } = await this.pgPool.query(
+        'SELECT id, COALESCE(ST_Y(user_last_known_location::geometry), latitude) as latitude, COALESCE(ST_X(user_last_known_location::geometry), longitude) as longitude FROM user_info WHERE id = ANY($1)',
+        [userIds],
+      );
+
+      const filteredUserIds = users
+        .filter((u) => {
+          if (u.latitude == null || u.longitude == null) return false;
+          return this.haversine(clubLat, clubLon, u.latitude, u.longitude) < 500;
+        })
+        .map((u) => u.id);
+
+      this.logger.log(`Users within 500km of club: ${filteredUserIds.length}`);
+      await this.cachePersonalizedClubFeedForAllUsers(filteredUserIds);
+      this.logger.log(`prePopulateClubFeedsInRange finished`);
+    } catch (error) {
+      this.logger.error('Error in prePopulateClubFeedsInRange', error);
+    }
+  }
+
+  async cachePersonalizedClubFeedForAllUsers(userIds: string[]) {
+    // 1. Fetch user locations
+    const { rows: users } = await this.pgPool.query(
+      `
+      SELECT id,
+             COALESCE(ST_Y(user_last_known_location::geometry), latitude) as latitude,
+             COALESCE(ST_X(user_last_known_location::geometry), longitude) as longitude
+      FROM user_info
+      WHERE id = ANY($1)
+    `,
+      [userIds],
+    );
+    const userMap = Object.fromEntries(users.map((u) => [u.id, u]));
+
+    // User interests
+    const { rows: userInterests } = await this.pgPool.query(
+      `SELECT user_id, interest_id FROM user_interests WHERE user_id = ANY($1)`,
+      [userIds],
+    );
+    const userInterestMap: Record<string, Set<string>> = {};
+    for (const { user_id, interest_id } of userInterests) {
+      if (!userInterestMap[user_id]) userInterestMap[user_id] = new Set();
+      userInterestMap[user_id].add(interest_id);
+    }
+
+    // User friends
+    const { rows: userFriends } = await this.pgPool.query(
+      `SELECT user_id, friend_id FROM user_friends WHERE user_id = ANY($1)`,
+      [userIds],
+    );
+    const userFriendMap: Record<string, Set<string>> = {};
+    for (const { user_id, friend_id } of userFriends) {
+      if (!userFriendMap[user_id]) userFriendMap[user_id] = new Set();
+      userFriendMap[user_id].add(friend_id);
+    }
+
+    // 2. Fetch all public clubs with member count
+    const { rows: allClubs } = await this.pgPool.query(`
+      SELECT c.id, c.latitude, c.longitude, c.created_at,
+             COUNT(cm.user_id) AS member_count
+      FROM club c
+      LEFT JOIN club_member cm ON c.id = cm.club_id
+      WHERE c.accessibility = 'PUBLIC'
+      GROUP BY c.id, c.latitude, c.longitude, c.created_at
+    `);
+
+    // Club interests
+    const { rows: clubInterests } = await this.pgPool.query(
+      `SELECT club_id, interest_id FROM club_interests`,
+    );
+    const clubInterestMap: Record<string, Set<string>> = {};
+    for (const { club_id, interest_id } of clubInterests) {
+      if (!clubInterestMap[club_id]) clubInterestMap[club_id] = new Set();
+      clubInterestMap[club_id].add(interest_id);
+    }
+
+    // Club members (for friend-in-club scoring)
+    const { rows: clubMembers } = await this.pgPool.query(
+      `SELECT club_id, user_id FROM club_member`,
+    );
+    const clubMemberMap: Record<string, Set<string>> = {};
+    for (const { club_id, user_id } of clubMembers) {
+      if (!clubMemberMap[club_id]) clubMemberMap[club_id] = new Set();
+      clubMemberMap[club_id].add(user_id);
+    }
+
+    const redisOps: Array<{ key: string; value: any }> = [];
+
+    // 3. Score clubs for each user
+    for (const userId of userIds) {
+      const user = userMap[userId];
+      if (!user) continue;
+      const userLat = user.latitude;
+      const userLon = user.longitude;
+      if (userLat == null || userLon == null) continue;
+
+      const userInterestsSet = userInterestMap[userId] || new Set();
+      const userFriendsSet = userFriendMap[userId] || new Set();
+
+      const nearbyClubs = allClubs.filter((club) => {
+        if (club.latitude == null || club.longitude == null) return false;
+        return this.haversine(userLat, userLon, club.latitude, club.longitude) < 500;
+      });
+
+      const scoredClubs = nearbyClubs.map((club) => {
+        const distance = this.haversine(userLat, userLon, club.latitude, club.longitude);
+        const locationScore = Math.max(0, 20 - (distance / 500) * 20);
+
+        const daysSinceCreated = Math.abs(dayjs().diff(dayjs(club.created_at), 'day'));
+        const timingScore = 20 / (daysSinceCreated + 1);
+
+        const memberCount = Number(club.member_count) || 0;
+        const popularityScore = Math.min(memberCount * 0.5, 10);
+
+        const clubInterestsSet = clubInterestMap[club.id] || new Set();
+        const jaccardScore = this.jaccard(userInterestsSet, clubInterestsSet) * 10;
+
+        const clubMembersSet = clubMemberMap[club.id] || new Set();
+        const friendMemberScore = Math.min(
+          [...clubMembersSet].filter((uid) => userFriendsSet.has(uid)).length * 3,
+          15,
+        );
+
+        const score = locationScore + timingScore + popularityScore + jaccardScore + friendMemberScore;
+        return { clubId: club.id, score };
+      });
+
+      const top = scoredClubs.sort((a, b) => b.score - a.score).slice(0, 500);
+
+      const redisKey = `personalized:club:feed:${userId}`;
+      const feedObj = {
+        club_ids: top.map((c) => c.clubId),
+        version: uuidv4(),
+        created_at: Date.now(),
+        total_clubs: top.length,
+      };
+      redisOps.push({ key: redisKey, value: feedObj });
+    }
+
+    const pipeline = this.redisClient.multi();
+    for (const op of redisOps) {
+      pipeline.set(op.key, JSON.stringify(op.value), { EX: 60 * 60 * 24 * 3 }); // 3 days TTL
     }
     await pipeline.exec();
   }

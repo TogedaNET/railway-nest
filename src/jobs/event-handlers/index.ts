@@ -7,3 +7,4 @@ export { UserFinalizeSignUpEventHandler } from './user-finalize-signup-event.han
 export { UserUpdateFeedEventHandler } from './user-update-feed-event.handler';
 export { UserDeleteEventHandler } from './user-delete-event.handler';
 export { UserBatchDeleteEventHandler } from './user-batch-delete.event.handler';
+export { ClubCreatedEventHandler } from './club-created-event.handler';
