@@ -170,34 +170,41 @@ export class FeedJobsService {
       // todo could be improved to not get all boosted posts?
       const boostedIds = await this.getBoostedPostsFromRedis();
 
+      // Fetch view counts for ALL posts once instead of per-cluster.
+      // `analytics:post:views` is a global hash, so one hmGet covers every cluster.
+      const allPostIds = posts.map((post) => post.id);
+      const viewCountMap: Record<string, number> = {};
+      if (allPostIds.length !== 0) {
+        const viewCounts = await this.redisClient.hmGet(
+          'analytics:post:views',
+          allPostIds,
+        );
+        allPostIds.forEach((postId, index) => {
+          viewCountMap[postId] = Number(viewCounts[index]) || 0;
+        });
+      }
+
       // 3. For each cluster, score posts by timing, partner boost, and popularity, and store top 500 in Redis
       // Also add all trending posts to a global geospatial index with TTL
       const geoKey = 'trending:geoindex';
+      // Accumulate geo + score members across all clusters so they can be
+      // written with a single geoAdd/zAdd instead of two round trips per post.
+      const geoMembers: Array<{
+        longitude: number;
+        latitude: number;
+        member: string;
+      }> = [];
+      const scoreMembers: Array<{ score: number; value: string }> = [];
       for (const [clusterHash, clusterPosts] of Object.entries(clusters)) {
         // get travel events created from inside this cluster.
         const travelPosts = posts.filter(post => {
           if (!post.current_lat || !post.current_lon) return false;
           const hash = ngeohash.encode(post.current_lat, post.current_lon, precision);
-          this.logger.log(`Current cluster hash: ${clusterHash}`)
-          this.logger.log(`Current hash of event with current_lat and current_lon: ${hash}`)
-          if (hash === clusterHash) {
-            this.logger.log('Same hash!');
-            return true; // remove log and refactor with 1 liners
-          }
+          if (hash === clusterHash) return true;
           return false;
 
         });
         const postsCombined = new Set([...clusterPosts, ...travelPosts]);
-        const postIds = Array.from(postsCombined).map((post) => post.id);
-        const viewCounts = await this.redisClient.hmGet(
-          'analytics:post:views',
-          postIds,
-        );
-        // Create a map for easier lookup
-        const viewCountMap = postIds.reduce((map, postId, index) => {
-          map[postId] = Number(viewCounts[index]) || 0;
-          return map;
-        }, {});
 
         const scored = Array.from(postsCombined).map((post) => {
           const daysSinceCreated = Math.abs(
@@ -217,7 +224,8 @@ export class FeedJobsService {
         // Sort by score descending and take top 500
         const top = scored.sort((a, b) => b.score - a.score).slice(0, 500);
 
-        // Add all posts in this cluster to the global geospatial index and save their score
+        // Collect all posts in this cluster for the global geospatial index
+        // and their score; the actual writes are batched after the loop.
         for (const post of top) {
           const lat = post.latitude;
           const lon = post.longitude;
@@ -232,20 +240,24 @@ export class FeedJobsService {
             );
             continue;
           }
-          await this.redisClient.geoAdd(geoKey, {
+          geoMembers.push({
             longitude: lon,
             latitude: lat,
             member: post.id.toString(),
           });
-
-          // Save score in a sorted set
-          await this.redisClient.zAdd('trending:geoindex:scores', [
-            {
-              score: post.score,
-              value: post.id.toString(),
-            },
-          ]);
+          scoreMembers.push({
+            score: post.score,
+            value: post.id.toString(),
+          });
         }
+      }
+
+      // Write the geospatial index and scores in a single command each.
+      if (geoMembers.length > 0) {
+        await this.redisClient.geoAdd(geoKey, geoMembers);
+      }
+      if (scoreMembers.length > 0) {
+        await this.redisClient.zAdd('trending:geoindex:scores', scoreMembers);
       }
       // Set TTL for the geospatial index key
       await this.redisClient.expire(geoKey, ONE_DAY_IN_SECONDS);
@@ -360,7 +372,7 @@ export class FeedJobsService {
     }
   }
 
-  @Cron(CronExpression.EVERY_DAY_AT_2AM)
+  @Cron(CronExpression.EVERY_DAY_AT_3AM)
   async prePopulateAllActiveUsersClubFeeds() {
     if (this.isRunning3) {
       this.logger.warn(
@@ -544,10 +556,16 @@ export class FeedJobsService {
       GROUP BY p.id, p.latitude, p.longitude, p.created_at, p.user_id, ui.user_role, p.club_id, p.user_current_location
     `);
 
+    // Only the posts we actually scored matter for the interest/participant
+    // maps below, so scope these reads to those IDs instead of scanning the
+    // entire post_interests / post_participant tables.
+    const allPostIds = allPosts.map((p) => p.id);
+
     // Post interests
-    const { rows: postInterests } = await this.pgPool.query(`
-      SELECT post_id, interest_id FROM post_interests
-    `);
+    const { rows: postInterests } = await this.pgPool.query(
+      `SELECT post_id, interest_id FROM post_interests WHERE post_id = ANY($1)`,
+      [allPostIds],
+    );
     const postInterestMap = {};
     for (const { post_id, interest_id } of postInterests) {
       if (!postInterestMap[post_id]) postInterestMap[post_id] = new Set();
@@ -555,9 +573,10 @@ export class FeedJobsService {
     }
 
     // Post participants
-    const { rows: postParticipants } = await this.pgPool.query(`
-      SELECT post_id, user_id FROM post_participant
-    `);
+    const { rows: postParticipants } = await this.pgPool.query(
+      `SELECT post_id, user_id FROM post_participant WHERE post_id = ANY($1)`,
+      [allPostIds],
+    );
     const postParticipantMap = {};
     for (const { post_id, user_id } of postParticipants) {
       if (!postParticipantMap[post_id]) postParticipantMap[post_id] = new Set();
@@ -568,6 +587,20 @@ export class FeedJobsService {
 
     // Read boosted post keys once and build a Set of boosted IDs
     let boostedIds = await this.getBoostedPostsFromRedis();
+
+    // Fetch view counts for ALL posts once. `analytics:post:views` is a global
+    // hash (counts are not per-user), so the previous per-user hmGet inside the
+    // loop was a redundant Redis round trip for every user in the rebuild.
+    const viewCountMap: Record<string, number> = {};
+    if (allPostIds.length !== 0) {
+      const viewCounts = await this.redisClient.hmGet(
+        'analytics:post:views',
+        allPostIds,
+      );
+      allPostIds.forEach((postId, index) => {
+        viewCountMap[postId] = Number(viewCounts[index]) || 0;
+      });
+    }
 
     // 3. For each user, score only posts within 500km (concurrently)
     for (const userId of userIds) {
@@ -604,19 +637,6 @@ export class FeedJobsService {
       });
 
       const postsCombined = Array.from(new Set([...nearbyPosts, ...nearbyCreatedPosts]));
-      const postIds = postsCombined.map((post) => post.id);
-      let viewCounts: string[];
-      if (postIds.length !== 0) {
-        viewCounts = await this.redisClient.hmGet(
-          'analytics:post:views',
-          postIds,
-        );
-      }
-      // Create a map for easier lookup
-      const viewCountMap = postIds.reduce((map, postId, index) => {
-        map[postId] = Number(viewCounts[index]) || 0;
-        return map;
-      }, {});
 
       const scoredPosts = postsCombined.map((post) => {
 
@@ -790,9 +810,15 @@ export class FeedJobsService {
       GROUP BY c.id, c.latitude, c.longitude, c.created_at
     `);
 
+    // Only the public clubs we just fetched are scored below, so scope the
+    // interest/member reads to those IDs instead of scanning the entire
+    // club_interests / club_member tables.
+    const allClubIds = allClubs.map((c) => c.id);
+
     // Club interests
     const { rows: clubInterests } = await this.pgPool.query(
-      `SELECT club_id, interest_id FROM club_interests`,
+      `SELECT club_id, interest_id FROM club_interests WHERE club_id = ANY($1)`,
+      [allClubIds],
     );
     const clubInterestMap: Record<string, Set<string>> = {};
     for (const { club_id, interest_id } of clubInterests) {
@@ -802,7 +828,8 @@ export class FeedJobsService {
 
     // Club members (for friend-in-club scoring)
     const { rows: clubMembers } = await this.pgPool.query(
-      `SELECT club_id, user_id FROM club_member`,
+      `SELECT club_id, user_id FROM club_member WHERE club_id = ANY($1)`,
+      [allClubIds],
     );
     const clubMemberMap: Record<string, Set<string>> = {};
     for (const { club_id, user_id } of clubMembers) {
@@ -877,6 +904,7 @@ export class FeedJobsService {
       // node-redis v4 scanIterator is available on the client
       for await (const key of (this.redisClient as any).scanIterator({
         MATCH: 'post:boosted:*',
+        COUNT: 1000,
       })) {
         keys.push(String(key));
       }
