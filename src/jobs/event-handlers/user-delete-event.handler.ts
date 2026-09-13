@@ -41,7 +41,20 @@ export class UserDeleteEventHandler extends BaseRedisEventHandler {
                 'SELECT email FROM user_info WHERE id = $1',
                 [userId],
             );
-            const userEmail = userEmailRows.length ? userEmailRows[0].email : 'unknown';
+
+            // Guard: if there is no user_info row (already deleted, replayed event,
+            // or a user that never completed signup) there is nothing to clean up.
+            // Proceeding would fail the fk_user_profilephotos_on_user constraint on the
+            // placeholder INSERT below and crash the process.
+            if (!userEmailRows.length) {
+                this.logger.warn(
+                    `user.delete event for user ${userId} skipped: no user_info row found (already deleted or never existed)`,
+                );
+                await client.query('ROLLBACK');
+                return;
+            }
+
+            const userEmail = userEmailRows[0].email;
             // 1. Delete all user posts
             const { rows: userPosts } = await client.query(
                 'SELECT id FROM post WHERE user_id = $1',
